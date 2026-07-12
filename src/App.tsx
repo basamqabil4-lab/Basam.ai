@@ -4,7 +4,7 @@
  */
 
 import React, { useState, useRef, useEffect } from 'react';
-import { Upload, Image as ImageIcon, Type, Hash, Maximize, Send, Copy, Check, Loader2, Plus, Map as MapIcon, BarChart3, Palette, Layers, Wand2, Monitor, Home, Sun, Moon, X, Cpu, FileText } from 'lucide-react';
+import { Upload, Image as ImageIcon, Type, Hash, Maximize, Send, Copy, Check, Loader2, Plus, Map as MapIcon, BarChart3, Palette, Layers, Wand2, Monitor, Home, Sun, Moon, X, FileText } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { generateInfographicPrompts, generateBackgroundPrompts, generateFHDPrompts, generateImageToPromptPrompts, PromptResult } from './services/geminiService';
 
