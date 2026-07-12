@@ -1,14 +1,9 @@
 import { GoogleGenAI, GenerateContentResponse, ThinkingLevel } from "@google/genai";
 
-// API Key Management System
+// API Key Management System (Fixed for Vite)
 function getApiKeys(): string[] {
-  let keysStr = "";
-  if (typeof process !== 'undefined' && process.env) {
-    keysStr = process.env.VITE_GEMINI_API_KEYS || process.env.GEMINI_API_KEYS || process.env.GEMINI_API_KEY || process.env.API_KEY || "";
-  }
-  if (!keysStr && typeof import.meta !== 'undefined' && (import.meta as any).env) {
-    keysStr = (import.meta as any).env.VITE_GEMINI_API_KEYS || (import.meta as any).env.VITE_GEMINI_API_KEY || "";
-  }
+  // لە Vite دەبێت ڕاستەوخۆ بەم شێوەیە بانگ بکرێت
+  const keysStr = import.meta.env.VITE_GEMINI_API_KEYS || import.meta.env.VITE_GEMINI_API_KEY || "";
   if (!keysStr) return [""];
   return keysStr.split(',').map(k => k.trim()).filter(k => k.length > 0);
 }
@@ -35,7 +30,10 @@ async function withRetry<T>(operation: (aiInstance: GoogleGenAI) => Promise<T>, 
 
   while (attempt < maxRetries) {
     try {
-      const aiInstance = new GoogleGenAI({ apiKey: getCurrentApiKey() });
+      const key = getCurrentApiKey();
+      if (!key) throw new Error("API Key نەدۆزرایەوە! دڵنیابە لە دانانی VITE_GEMINI_API_KEYS لە Vercel.");
+      
+      const aiInstance = new GoogleGenAI({ apiKey: key });
       return await operation(aiInstance);
     } catch (error: any) {
       attempt++;
@@ -258,7 +256,6 @@ export async function generateInfographicPrompts(request: PromptRequest, customM
       if (imagePart) contents.parts.unshift(imagePart);
       if (bgPresetPart) contents.parts.unshift(bgPresetPart);
 
-      // USING THE MODIFIED withRetry WITH aiInstance PASSED AS ARGUMENT
       const response: GenerateContentResponse = await withRetry((aiInstance) => aiInstance.models.generateContent({
         model: model,
         contents: contents,
