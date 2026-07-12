@@ -3,25 +3,9 @@ import { GoogleGenAI, GenerateContentResponse, ThinkingLevel } from "@google/gen
 // ==========================================
 // 🔄 API KEY ROTATION SETUP
 // ==========================================
-function getEnvKeys(): string {
-  try {
-    if (typeof import.meta !== 'undefined' && (import.meta as any).env) {
-      const env = (import.meta as any).env;
-      if (env.VITE_GEMINI_API_KEYS) return env.VITE_GEMINI_API_KEYS;
-      if (env.VITE_GEMINI_API_KEY) return env.VITE_GEMINI_API_KEY;
-    }
-  } catch (e) {}
-  try {
-    if (typeof process !== 'undefined' && process.env) {
-      if (process.env.VITE_GEMINI_API_KEYS) return process.env.VITE_GEMINI_API_KEYS;
-      if (process.env.GEMINI_API_KEY) return process.env.GEMINI_API_KEY;
-      if (process.env.API_KEY) return process.env.API_KEY;
-    }
-  } catch (e) {}
-  return "";
-}
+// زۆر گرنگە بەم شێوەیە بنووسرێت بۆ ئەوەی Vite لە کاتی Build بیخوێنێتەوە
+const keysString = import.meta.env.VITE_GEMINI_API_KEYS || "";
 
-const keysString = getEnvKeys();
 const apiKeys = keysString
   .split(',')
   .map((key: string) => key.trim())
@@ -30,7 +14,9 @@ const apiKeys = keysString
 let currentKeyIndex = 0;
 
 function getCurrentKey(): string {
-  if (apiKeys.length === 0) return "";
+  if (apiKeys.length === 0) {
+    throw new Error("VITE_GEMINI_API_KEYS is missing! Please check Vercel Environment Variables.");
+  }
   return apiKeys[currentKeyIndex];
 }
 
@@ -64,7 +50,7 @@ async function withRetry<T>(operation: () => Promise<T>, maxRetries = apiKeys.le
         errorStr.includes("resource_exhausted");
                            
       if (isQuotaError && attempt < maxRetries) {
-        rotateKey(); // Rotate key on quota error!
+        rotateKey(); // گۆڕینی کلیل لە کاتی تەواوبوونی لیمیت
         const delay = baseDelay * Math.pow(1.5, attempt - 1) + Math.random() * 1000;
         console.warn(`Quota exceeded. Retrying in ${Math.round(delay)}ms... (Attempt ${attempt} of ${maxRetries})`);
         await new Promise(resolve => setTimeout(resolve, delay));
@@ -327,7 +313,7 @@ export async function generateInfographicPrompts(request: PromptRequest, customM
       console.error(`Error generating prompt for style ${styleConfig.title}:`, error);
       let errorMessage = "Error generating prompt for this style.";
       
-      if (error?.message?.includes("API_KEY_INVALID")) {
+      if (error?.message?.includes("API_KEY_INVALID") || error?.message?.includes("API key not valid")) {
         errorMessage = "Invalid API Key. Please check your configuration.";
       } else if (error?.message?.includes("Quota exceeded") || error?.message?.includes("429")) {
         errorMessage = "Quota exceeded (Free Tier). Please wait a moment and try again.";
