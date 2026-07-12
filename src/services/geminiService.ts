@@ -1,43 +1,15 @@
 import { GoogleGenAI, GenerateContentResponse, ThinkingLevel } from "@google/genai";
 
-// API Key Management System (Fixed for Vite)
-function getApiKeys(): string[] {
-  // لە Vite دەبێت ڕاستەوخۆ بەم شێوەیە بانگ بکرێت
-  const keysStr = import.meta.env.VITE_GEMINI_API_KEYS || import.meta.env.VITE_GEMINI_API_KEY || "";
-  if (!keysStr) return [""];
-  return keysStr.split(',').map(k => k.trim()).filter(k => k.length > 0);
-}
-
-let apiKeys = getApiKeys();
-let currentKeyIndex = 0;
-
-function getCurrentApiKey(): string {
-  if (apiKeys.length === 0) return "";
-  return apiKeys[currentKeyIndex % apiKeys.length];
-}
-
-function rotateApiKey(): string {
-  if (apiKeys.length <= 1) return getCurrentApiKey();
-  currentKeyIndex = (currentKeyIndex + 1) % apiKeys.length;
-  console.warn(`Rotated to API Key #${currentKeyIndex + 1}`);
-  return getCurrentApiKey();
-}
-
-// Utility function to handle API calls with exponential backoff and automatic Key Rotation
-async function withRetry<T>(operation: (aiInstance: GoogleGenAI) => Promise<T>, maxRetries = 6, baseDelay = 2000): Promise<T> {
+// Utility function to handle API calls with exponential backoff for quota errors
+async function withRetry<T>(operation: () => Promise<T>, maxRetries = 6, baseDelay = 2000): Promise<T> {
   let attempt = 0;
-  let keysAttempted = 0;
-
   while (attempt < maxRetries) {
     try {
-      const key = getCurrentApiKey();
-      if (!key) throw new Error("API Key نەدۆزرایەوە! دڵنیابە لە دانانی VITE_GEMINI_API_KEYS لە Vercel.");
-      
-      const aiInstance = new GoogleGenAI({ apiKey: key });
-      return await operation(aiInstance);
+      return await operation();
     } catch (error: any) {
       attempt++;
       
+      // Better error detection for quota issues
       const errorStr = JSON.stringify(error).toLowerCase();
       const isQuotaError = 
         error?.message?.toLowerCase().includes("quota exceeded") || 
@@ -51,22 +23,16 @@ async function withRetry<T>(operation: (aiInstance: GoogleGenAI) => Promise<T>, 
         errorStr.includes("exhausted") ||
         errorStr.includes("resource_exhausted");
                            
-      if (isQuotaError) {
-        keysAttempted++;
-        // If we have multiple keys and haven't tried them all yet in this cycle
-        if (apiKeys.length > 1 && keysAttempted <= apiKeys.length) {
-          rotateApiKey();
-          console.warn(`Quota exceeded. Switched to next API Key. Retrying immediately...`);
-          continue; // Skip the delay, immediately retry with new key
-        } else if (attempt < maxRetries) {
-          // All keys exhausted or only 1 key, fallback to delay
-          const delay = baseDelay * Math.pow(2, attempt - 1) + Math.random() * 1000;
-          console.warn(`All keys quota exceeded. Retrying in ${Math.round(delay)}ms... (Attempt ${attempt} of ${maxRetries})`);
-          await new Promise(resolve => setTimeout(resolve, delay));
-        } else {
-          throw new Error("QUOTA_EXHAUSTED: All API keys have reached their rate limit. Please wait a moment before trying again.");
-        }
+      if (isQuotaError && attempt < maxRetries) {
+        // Exponential backoff with jitter
+        const delay = baseDelay * Math.pow(2, attempt - 1) + Math.random() * 1000;
+        console.warn(`Quota exceeded. Retrying in ${Math.round(delay)}ms... (Attempt ${attempt} of ${maxRetries})`);
+        await new Promise(resolve => setTimeout(resolve, delay));
       } else {
+        // If it's a quota error but we've reached max retries, throw a clearer error
+        if (isQuotaError) {
+          throw new Error("QUOTA_EXHAUSTED: You have reached the API rate limit. Please wait a moment before trying again.");
+        }
         throw error;
       }
     }
@@ -80,7 +46,7 @@ export interface PromptRequest {
   numberFont: string;
   englishFont: string;
   aspectRatio: string;
-  styleImages: string[];
+  styleImages: string[]; // base64 strings
   selectedStyles?: string[];
   mode: 'infographic' | 'map';
   useAvaStyle?: boolean;
@@ -115,8 +81,10 @@ export async function generateInfographicPrompts(request: PromptRequest, customM
     'purple-special': { title: 'Purple Special', desc: 'A professional, easy-to-understand infographic with a slightly dark purple background. The typography and visual elements must strictly use a color palette of white, purple, pink, and blue.' }
   };
 
+  // Determine styles to generate
   const stylesToGenerate: { title: string; description: string; image?: string }[] = [];
 
+  // 1. Add selected preset styles
   if (request.selectedStyles && request.selectedStyles.length > 0) {
     request.selectedStyles.forEach(styleId => {
       if (presetStyleMap[styleId]) {
@@ -128,6 +96,7 @@ export async function generateInfographicPrompts(request: PromptRequest, customM
     });
   }
 
+  // 2. Add uploaded images
   if (request.styleImages && request.styleImages.length > 0) {
     request.styleImages.forEach((img, idx) => {
       stylesToGenerate.push({ 
@@ -138,12 +107,14 @@ export async function generateInfographicPrompts(request: PromptRequest, customM
     });
   }
 
+  // 3. If nothing selected/uploaded, use a single General style instead of all presets
   if (stylesToGenerate.length === 0) {
     stylesToGenerate.push({ 
       title: request.bgPresetName ? `Preset ${request.bgPresetName.toUpperCase()}` : 'General Style', 
       description: 'A professional and clean data visualization style that focuses on clarity and modern aesthetics.' 
     });
   } else if (request.bgPresetName) {
+    // Append BG Preset name to selected styles
     stylesToGenerate.forEach(style => {
       style.title = `${style.title} + ${request.bgPresetName.toUpperCase()}`;
     });
@@ -202,6 +173,7 @@ export async function generateInfographicPrompts(request: PromptRequest, customM
       : "";
 
     const isBPreset = request.bgPresetName?.toLowerCase().startsWith('b');
+
     const formattedData = request.data.map((d, i) => `--- SLIDE ${i + 1} DATA ---\n${d}\n`).join('\n');
 
     const textPart = {
@@ -252,11 +224,18 @@ export async function generateInfographicPrompts(request: PromptRequest, customM
     };
 
     try {
+      // Initialize AI inside the loop to ensure fresh context
+      const aiInstance = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || process.env.API_KEY || "" });
+      
       const contents: any = { parts: [textPart] };
-      if (imagePart) contents.parts.unshift(imagePart);
-      if (bgPresetPart) contents.parts.unshift(bgPresetPart);
+      if (imagePart) {
+        contents.parts.unshift(imagePart);
+      }
+      if (bgPresetPart) {
+        contents.parts.unshift(bgPresetPart);
+      }
 
-      const response: GenerateContentResponse = await withRetry((aiInstance) => aiInstance.models.generateContent({
+      const response: GenerateContentResponse = await withRetry(() => aiInstance.models.generateContent({
         model: model,
         contents: contents,
         config: {
@@ -273,8 +252,12 @@ export async function generateInfographicPrompts(request: PromptRequest, customM
         });
       } else {
         let text = response.text.trim();
-        if (text.startsWith('```json')) text = text.replace(/^```json\n/, '').replace(/\n```$/, '');
-        else if (text.startsWith('```')) text = text.replace(/^```\n/, '').replace(/\n```$/, '');
+        // Remove markdown code blocks if present
+        if (text.startsWith('```json')) {
+          text = text.replace(/^```json\n/, '').replace(/\n```$/, '');
+        } else if (text.startsWith('```')) {
+          text = text.replace(/^```\n/, '').replace(/\n```$/, '');
+        }
         
         try {
           const parsed = JSON.parse(text);
@@ -283,17 +266,21 @@ export async function generateInfographicPrompts(request: PromptRequest, customM
           const exactStyle = `Style: ${baseStyleInstruction}${styleDescription}`;
           
           if (Array.isArray(parsed) && parsed.length > 0 && parsed[0].prompts && Array.isArray(parsed[0].prompts)) {
-            promptsArray = parsed[0].prompts.map((p: string) => {
+            promptsArray = parsed[0].prompts.map((p: string, i: number) => {
               let slidePrompt = p.trim();
               if (!slidePrompt.includes(exactStyle)) {
                 slidePrompt += `\n\n${exactStyle}`;
               }
               return slidePrompt;
             });
+            
             finalPrompt = promptsArray.map((p, i) => `[ SLIDE ${i + 1} ]\n${p}`).join('\n\n');
           } else {
+            // Fallback if not matching expected structure
             finalPrompt = text;
-            if (!finalPrompt.includes(exactStyle)) finalPrompt += `\n\n${exactStyle}`;
+            if (!finalPrompt.includes(exactStyle)) {
+              finalPrompt += `\n\n${exactStyle}`;
+            }
             promptsArray = [finalPrompt];
           }
           
@@ -305,9 +292,12 @@ export async function generateInfographicPrompts(request: PromptRequest, customM
           });
         } catch (e) {
           console.error("Failed to parse JSON in infographic prompts", e);
+          // Fallback to raw text
           let finalPrompt = text;
           const exactStyle = `Style: ${baseStyleInstruction}${styleDescription}`;
-          if (!finalPrompt.includes(exactStyle)) finalPrompt += `\n\n${exactStyle}`;
+          if (!finalPrompt.includes(exactStyle)) {
+            finalPrompt += `\n\n${exactStyle}`;
+          }
           results.push({
             title: styleConfig.title,
             prompt: finalPrompt,
@@ -338,8 +328,10 @@ export async function generateInfographicPrompts(request: PromptRequest, customM
       });
     }
     
+    // Add a small delay between requests to avoid hitting rate limits too quickly
     await new Promise(resolve => setTimeout(resolve, 800));
   }
+
   return results;
 }
 
@@ -360,6 +352,7 @@ export interface ImageToPromptRequest {
 
 export async function generateImageToPromptPrompts(request: ImageToPromptRequest, customModel?: string): Promise<PromptResult[]> {
   const model = customModel || "gemini-3-flash-preview";
+  const aiInstance = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || process.env.API_KEY || "" });
 
   const presetStyleMap: Record<string, { title: string; desc: string }> = {
     'cyber-map': { title: 'Cyber Map', desc: 'Futuristic tactical UI with glowing lines, data points, and a dark blue/cyan aesthetic.' },
@@ -437,7 +430,7 @@ export async function generateImageToPromptPrompts(request: ImageToPromptRequest
   };
 
   try {
-    const response = await withRetry((aiInstance) => aiInstance.models.generateContent({
+    const response = await withRetry(() => aiInstance.models.generateContent({
       model: model,
       contents: { parts: [mainImagePart, ...imageParts, textPart] },
       config: {
@@ -446,7 +439,9 @@ export async function generateImageToPromptPrompts(request: ImageToPromptRequest
       }
     }));
 
-    if (!response.text) return [{ title: "Error", prompt: "Failed to generate prompt from image." }];
+    if (!response.text) {
+      return [{ title: "Error", prompt: "Failed to generate prompt from image." }];
+    }
 
     try {
       const parsed = JSON.parse(response.text);
@@ -462,6 +457,7 @@ export async function generateImageToPromptPrompts(request: ImageToPromptRequest
       console.error("Failed to parse JSON", e);
       return [{ title: "Raw Output", prompt: response.text }];
     }
+
   } catch (error: any) {
     console.error("Error generating image-to-prompt:", error);
     return [{ title: "Error", prompt: `API Error: ${error.message}` }];
@@ -484,6 +480,7 @@ export interface FHDPromptRequest {
 
 export async function generateFHDPrompts(request: FHDPromptRequest, customModel?: string): Promise<PromptResult[]> {
   const model = customModel || "gemini-3-flash-preview";
+  const aiInstance = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || process.env.API_KEY || "" });
 
   let imageInstruction = "";
   let imageParts: any[] = [];
@@ -587,7 +584,7 @@ export async function generateFHDPrompts(request: FHDPromptRequest, customModel?
   try {
     const contents: any = { parts: [...imageParts, textPart] };
 
-    const response = await withRetry((aiInstance) => aiInstance.models.generateContent({
+    const response = await withRetry(() => aiInstance.models.generateContent({
       model: model,
       contents: contents,
       config: {
@@ -596,14 +593,18 @@ export async function generateFHDPrompts(request: FHDPromptRequest, customModel?
       }
     }));
 
-    if (!response.text) return [{ title: "Error", prompt: "Failed to generate prompts." }];
+    if (!response.text) {
+      return [{ title: "Error", prompt: "Failed to generate prompts." }];
+    }
 
     try {
-      return JSON.parse(response.text);
+      const parsed = JSON.parse(response.text);
+      return parsed;
     } catch (e) {
       console.error("Failed to parse JSON", e);
       return [{ title: "Raw Output", prompt: response.text }];
     }
+
   } catch (error: any) {
     console.error("Error generating FHD prompts:", error);
     return [{ title: "Error", prompt: `API Error: ${error.message}` }];
@@ -624,7 +625,8 @@ export interface BackgroundPromptRequest {
 }
 
 export async function generateBackgroundPrompts(request: BackgroundPromptRequest, customModel?: string): Promise<PromptResult[]> {
-  const model = customModel || "gemini-3-flash-preview";
+  const model = customModel || "gemini-3-flash-preview"; // Using Flash for better quota limits
+  const aiInstance = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || process.env.API_KEY || "" });
 
   let styleInstruction = "";
   if (request.style === 'realistic') {
@@ -688,24 +690,28 @@ export async function generateBackgroundPrompts(request: BackgroundPromptRequest
   try {
     const contents: any = { parts: [...imageParts, textPart] };
 
-    const response = await withRetry((aiInstance) => aiInstance.models.generateContent({
+    const response = await withRetry(() => aiInstance.models.generateContent({
       model: model,
       contents: contents,
       config: {
-        tools: [{ googleSearch: {} }], 
+        tools: [{ googleSearch: {} }], // Enable search for accurate location details
         responseMimeType: "application/json",
         thinkingConfig: { thinkingLevel: ThinkingLevel.LOW }
       }
     }));
 
-    if (!response.text) return [{ title: "Error", prompt: "Failed to generate prompts." }];
+    if (!response.text) {
+      return [{ title: "Error", prompt: "Failed to generate prompts." }];
+    }
 
     try {
-      return JSON.parse(response.text);
+      const parsed = JSON.parse(response.text);
+      return parsed;
     } catch (e) {
       console.error("Failed to parse JSON", e);
       return [{ title: "Raw Output", prompt: response.text }];
     }
+
   } catch (error: any) {
     console.error("Error generating background prompts:", error);
     return [{ title: "Error", prompt: `API Error: ${error.message}` }];
@@ -759,8 +765,13 @@ export async function generateImageFromPrompt(prompt: string, aspectRatio: strin
       },
     };
 
-    if (seed !== undefined) config.seed = seed;
-    if (highQuality) config.imageConfig.imageSize = mode === 'fhd' ? "4K" : "1K";
+    if (seed !== undefined) {
+      config.seed = seed;
+    }
+
+    if (highQuality) {
+      config.imageConfig.imageSize = mode === 'fhd' ? "4K" : "1K";
+    }
 
     const parts: any[] = [];
     if (bgPresetImage && (mode === 'infographic' || mode === 'fhd')) {
@@ -783,7 +794,8 @@ export async function generateImageFromPrompt(prompt: string, aspectRatio: strin
     }
     parts.push({ text: finalPrompt });
 
-    const response = await withRetry((aiInstance) => aiInstance.models.generateContent({
+    const aiInstance = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || process.env.API_KEY || "" });
+    const response = await withRetry(() => aiInstance.models.generateContent({
       model: model,
       contents: {
         parts: parts,
@@ -792,7 +804,9 @@ export async function generateImageFromPrompt(prompt: string, aspectRatio: strin
     }));
 
     for (const part of response.candidates[0].content.parts) {
-      if (part.inlineData) return `data:image/png;base64,${part.inlineData.data}`;
+      if (part.inlineData) {
+        return `data:image/png;base64,${part.inlineData.data}`;
+      }
     }
     throw new Error("No image data returned from Gemini.");
   } catch (error) {
@@ -820,7 +834,8 @@ Photorealistic textures only. True-to-source enhancement only.
 Keep everything exactly the same only enhance quality.`;
 
   try {
-    const response = await withRetry((aiInstance) => aiInstance.models.generateContent({
+    const aiInstance = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || process.env.API_KEY || "" });
+    const response = await withRetry(() => aiInstance.models.generateContent({
       model: model,
       contents: {
         parts: [
@@ -842,7 +857,9 @@ Keep everything exactly the same only enhance quality.`;
     }));
 
     for (const part of response.candidates[0].content.parts) {
-      if (part.inlineData) return `data:image/png;base64,${part.inlineData.data}`;
+      if (part.inlineData) {
+        return `data:image/png;base64,${part.inlineData.data}`;
+      }
     }
     throw new Error("No image data returned from Gemini.");
   } catch (error) {
