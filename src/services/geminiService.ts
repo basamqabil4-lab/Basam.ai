@@ -26,7 +26,7 @@ function rotateKey() {
   }
 }
 
-// لێرەدا ژمارەی تاقیکردنەوەکانم کەمکردووەتەوە تەنها بۆ ژمارەی کلیلەکان
+// Utility function to handle API calls with exponential backoff for quota errors
 async function withRetry<T>(operation: () => Promise<T>): Promise<T> {
   const maxRetries = Math.max(1, apiKeys.length);
   let attempt = 0;
@@ -51,8 +51,8 @@ async function withRetry<T>(operation: () => Promise<T>): Promise<T> {
         errorStr.includes("resource_exhausted");
                            
       if (isQuotaError && attempt < maxRetries) {
-        rotateKey(); // گۆڕینی کلیل
-        // وەستان بۆ ماوەی ٢ چرکە پێش بەکارهێنانی کلیلی نوێ بۆ ئەوەی بلۆک نەبێت
+        rotateKey(); // گۆڕینی کلیل لە کاتی تەواوبوونی لیمیت
+        // وەستان بۆ ماوەی ٢ چرکە پێش بەکارهێنانی کلیلی نوێ
         await new Promise(resolve => setTimeout(resolve, 2000));
       } else {
         if (isQuotaError) {
@@ -66,7 +66,7 @@ async function withRetry<T>(operation: () => Promise<T>): Promise<T> {
 }
 
 // ==========================================
-// 🚀 PROMPT GENERATOR FUNCTIONS
+// 🚀 PROMPT GENERATOR FUNCTIONS (TEXT ONLY)
 // ==========================================
 
 export interface PromptRequest {
@@ -257,7 +257,6 @@ export async function generateInfographicPrompts(request: PromptRequest, customM
       });
     }
     
-    // وەستانێکی درێژتر (٢.٥ چرکە) بۆ ئەوەی گووگڵ بە سپام هەژماری نەکات
     await new Promise(resolve => setTimeout(resolve, 2500));
   }
 
