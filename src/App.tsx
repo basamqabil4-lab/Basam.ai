@@ -164,7 +164,7 @@ Keep everything exactly the same only enhance quality.`);
   const [prompts, setPrompts] = useState<PromptResult[]>([]);
   const [activeSlide, setActiveSlide] = useState<Record<number, number>>({});
   const [isHighQuality, setIsHighQuality] = useState(false);
-  const [selectedModel] = useState('gemini-3.1-pro-preview');
+  const [selectedModel] = useState('gemini-1.5-flash');
   const [generatedImages, setGeneratedImages] = useState<Record<number, { url: string, bgPresetImage: string | null }>>({});
   const [isGeneratingImage, setIsGeneratingImage] = useState<Record<number, boolean>>({});
   const [isEnhancingImage, setIsEnhancingImage] = useState<Record<number, boolean>>({});
