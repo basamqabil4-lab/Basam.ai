@@ -6,7 +6,7 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { Upload, Image as ImageIcon, Type, Hash, Maximize, Send, Copy, Check, Loader2, Plus, Map as MapIcon, BarChart3, Palette, Layers, Wand2, Monitor, Home, Sun, Moon, X, Cpu, FileText } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
-import { generateInfographicPrompts, generateBackgroundPrompts, generateFHDPrompts, generateImageToPromptPrompts, PromptResult, generateImageFromPrompt, enhanceImage } from './services/geminiService';
+import { generateInfographicPrompts, generateBackgroundPrompts, generateFHDPrompts, generateImageToPromptPrompts, PromptResult } from './services/geminiService';
 
 declare global {
   interface Window {
@@ -16,9 +16,6 @@ declare global {
     };
   }
 }
-
-
-
 
 const TEXT_FONTS = [
   "IBM Plex Sans Arabic"
@@ -116,7 +113,6 @@ export default function App() {
   const [infoColor2, setInfoColor2] = useState('#3b82f6');
   const [infoBackgroundColor, setInfoBackgroundColor] = useState('#390075');
   const [selectedBgPreset, setSelectedBgPreset] = useState<string | null>('B1');
-  const [b1Image, setB1Image] = useState<string | null>(null);
   const [customBgPresets, setCustomBgPresets] = useState<{ id: string; image: string }[]>([
     { id: 'B1', image: 'data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIxMDAiIGhlaWdodD0iMTAwIj4KICA8cmVjdCB3aWR0aD0iMTAwIiBoZWlnaHQ9IjEwMCIgZmlsbD0iIzFlM2E4YSIvPgogIDx0ZXh0IHg9IjUwIiB5PSI1MCIgZmlsbD0id2hpdGUiIGZvbnQtZmFtaWx5PSJzYW5zLXNlcmlmIiBmb250LXNpemU9IjIwIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBkb21pbmFudC1iYXNlbGluZT0ibWlkZGxlIj5CMTwvdGV4dD4KPC9zdmc+' }
   ]);
@@ -163,11 +159,7 @@ Keep everything exactly the same only enhance quality.`);
   const [height, setHeight] = useState('1620');
   const [prompts, setPrompts] = useState<PromptResult[]>([]);
   const [activeSlide, setActiveSlide] = useState<Record<number, number>>({});
-  const [isHighQuality, setIsHighQuality] = useState(false);
   const [selectedModel] = useState('gemini-3-flash-preview');
-  const [generatedImages, setGeneratedImages] = useState<Record<number, { url: string, bgPresetImage: string | null }>>({});
-  const [isGeneratingImage, setIsGeneratingImage] = useState<Record<number, boolean>>({});
-  const [isEnhancingImage, setIsEnhancingImage] = useState<Record<number, boolean>>({});
   const [isLoading, setIsLoading] = useState(false);
   const [copiedIndices, setCopiedIndices] = useState<number[]>([]);
 
@@ -270,8 +262,6 @@ Keep everything exactly the same only enhance quality.`);
     }
 
     setIsLoading(true);
-    setGeneratedImages({});
-    setIsGeneratingImage({});
     setCopiedIndices([]);
     try {
       const aspectRatio = calculateAspectRatio(width, height);
@@ -367,131 +357,6 @@ Keep everything exactly the same only enhance quality.`);
       }
     } finally {
       setIsLoading(false);
-    }
-  };
-
-  const handleGenerateImage = async (prompt: string, index: number, seed?: number) => {
-    if (isHighQuality) {
-      try {
-        const hasKey = await window.aistudio.hasSelectedApiKey();
-        if (!hasKey) {
-          await window.aistudio.openSelectKey();
-          return;
-        }
-      } catch (e) {
-        console.error("API Key selection error:", e);
-      }
-    }
-
-    setIsGeneratingImage(prev => ({ ...prev, [index]: true }));
-    try {
-      const aspectRatio = calculateAspectRatio(width, height);
-      const validAspectRatios = ["1:1", "3:4", "4:3", "9:16", "16:9", "1:4", "1:8", "4:1", "8:1"];
-      const finalAspectRatio = validAspectRatios.includes(aspectRatio) ? aspectRatio : "16:9";
-      
-      const customText = mainMode === 'background' ? bgCustomText : (mainMode === 'fhd' ? fhdTextOverlay : undefined);
-      const refImages = mainMode === 'fhd' ? fhdImages : undefined;
-      const keepOriginal = mainMode === 'fhd' ? keepOriginalCharacters : undefined;
-      const bgPresetImg = mainMode === 'fhd' && selectedBgPreset && selectedBgPreset !== 'B1' ? customBgPresets.find(p => p.id === selectedBgPreset)?.image || null : null;
-      
-      let finalPromptForImage = prompt;
-      if (mainMode === 'fhd' && (safeZoneLeft > 0 || safeZoneRight > 0 || safeZoneTop > 0)) {
-        finalPromptForImage += `\n\nCRITICAL INSTRUCTION: You MUST ensure that all persons/subjects are positioned with specific padding from the edges. They MUST be placed approximately ${safeZoneLeft}% away from the left edge, ${safeZoneRight}% away from the right edge, and ${safeZoneTop}% away from the top edge. Do not place subjects near these edges.`;
-      }
-      
-      const imageUrl = await generateImageFromPrompt(finalPromptForImage, finalAspectRatio, isHighQuality, mainMode, customText, refImages, keepOriginal, bgPresetImg, mainMode === 'fhd' ? subjectDistance : undefined, seed);
-      setGeneratedImages(prev => ({ ...prev, [index]: { url: imageUrl, bgPresetImage: bgPresetImg } }));
-    } catch (error: any) {
-      console.error(error);
-      const isQuotaError = error?.message?.includes("Quota exceeded") || 
-                           error?.message?.includes("429") || 
-                           error?.status === "RESOURCE_EXHAUSTED" ||
-                           error?.status === 429;
-                           
-      if (isQuotaError) {
-        try {
-          const hasKey = await window.aistudio.hasSelectedApiKey();
-          if (!hasKey) {
-            await window.aistudio.openSelectKey();
-            alert("Please try generating the image again.");
-          } else {
-            alert("Your selected API key has exceeded its quota. Please check your billing details or try again later.");
-          }
-        } catch (e) {
-          console.error("API Key selection error:", e);
-          alert("Quota exceeded. Please try again later.");
-        }
-      } else {
-        alert(error?.message || "Failed to generate image. Please try again.");
-      }
-    } finally {
-      setIsGeneratingImage(prev => ({ ...prev, [index]: false }));
-    }
-  };
-
-  const handleEnhanceImage = async (index: number) => {
-    const base64Image = fhdImages[index];
-    if (!base64Image) return;
-
-    try {
-      const hasKey = await window.aistudio.hasSelectedApiKey();
-      if (!hasKey) {
-        await window.aistudio.openSelectKey();
-        return;
-      }
-    } catch (e) {
-      console.error("API Key selection error:", e);
-    }
-
-    setIsEnhancingImage(prev => ({ ...prev, [index]: true }));
-    try {
-      // Calculate aspect ratio from the image if possible, or default to 1:1
-      const img = new Image();
-      img.src = base64Image;
-      await new Promise((resolve) => {
-        img.onload = resolve;
-      });
-      
-      let aspectRatio = "1:1";
-      if (img.width && img.height) {
-        const ratio = img.width / img.height;
-        if (ratio > 1.5) aspectRatio = "16:9";
-        else if (ratio > 1.1) aspectRatio = "4:3";
-        else if (ratio < 0.6) aspectRatio = "9:16";
-        else if (ratio < 0.9) aspectRatio = "3:4";
-      }
-
-      const enhancedImageUrl = await enhanceImage(base64Image, aspectRatio, isHighQuality);
-      setFhdImages(prev => {
-        const newImages = [...prev];
-        newImages[index] = enhancedImageUrl;
-        return newImages;
-      });
-    } catch (error: any) {
-      console.error(error);
-      const isQuotaError = error?.message?.includes("Quota exceeded") || 
-                           error?.message?.includes("429") || 
-                           error?.status === "RESOURCE_EXHAUSTED" ||
-                           error?.status === 429;
-                           
-      if (isQuotaError) {
-        try {
-          const hasKey = await window.aistudio.hasSelectedApiKey();
-          if (!hasKey) {
-            await window.aistudio.openSelectKey();
-            alert("Please try enhancing the image again.");
-          } else {
-            alert("Your selected API key has exceeded its quota. Please check your billing details or try again later.");
-          }
-        } catch (e) {
-          console.error("API Key selection error:", e);
-          alert("Quota exceeded. Please try again later.");
-        }
-      } else {
-        alert(error?.message || "Failed to enhance image. Please try again.");
-      }
-    } finally {
-      setIsEnhancingImage(prev => ({ ...prev, [index]: false }));
     }
   };
 
@@ -1368,14 +1233,6 @@ Keep everything exactly the same only enhance quality.`);
                         >
                           <X size={12} />
                         </button>
-                        <button
-                          onClick={() => handleEnhanceImage(idx)}
-                          disabled={isEnhancingImage[idx]}
-                          className="absolute -bottom-2 -right-2 bg-[#00f0ff] text-black rounded-full p-1.5 shadow-lg opacity-0 group-hover:opacity-100 transition-opacity disabled:opacity-50 disabled:cursor-not-allowed"
-                          title="Enhance Image Quality"
-                        >
-                          {isEnhancingImage[idx] ? <Loader2 size={12} className="animate-spin" /> : <Wand2 size={12} />}
-                        </button>
                       </div>
                     ))}
                     <label className="w-20 h-20 flex flex-col items-center justify-center gap-2 bg-white/5 hover:bg-white/10 border-2 border-dashed border-white/10 rounded-2xl cursor-pointer transition-all hover:border-[#00f0ff]/50 group">
@@ -1625,27 +1482,6 @@ Keep everything exactly the same only enhance quality.`);
 
           <div className="liquid-panel rounded-[32px] p-6 flex items-center justify-between">
             <div className="flex items-center gap-2">
-              <div className={`p-2 rounded-xl ${isHighQuality ? 'bg-white/10 text-[#00f0ff]' : 'bg-white/5 text-white/40'}`}>
-                <Maximize size={18} />
-              </div>
-              <div className="flex flex-col">
-                <span className="text-sm font-medium text-white">High Quality Mode</span>
-                <span className="text-[10px] text-white/60 uppercase tracking-wider">Gemini 3.1 Flash Image</span>
-              </div>
-            </div>
-            <button 
-              onClick={() => setIsHighQuality(!isHighQuality)}
-              className={`relative w-12 h-6 rounded-full transition-colors duration-300 ${isHighQuality ? 'bg-[#00f0ff]' : 'bg-white/5'}`}
-            >
-              <motion.div 
-                animate={{ x: isHighQuality ? 26 : 4 }}
-                className="absolute top-1 left-0 w-4 h-4 bg-white rounded-full shadow-md"
-              />
-            </button>
-          </div>
-
-          <div className="liquid-panel rounded-[32px] p-6 flex items-center justify-between">
-            <div className="flex items-center gap-2">
               <div className={`p-2 rounded-xl ${useAvaStyle ? 'bg-white/10 text-[#00f0ff]' : 'bg-white/5 text-white/40'}`}>
                 <Wand2 size={18} />
               </div>
@@ -1681,11 +1517,10 @@ Keep everything exactly the same only enhance quality.`);
             <AnimatePresence mode="popLayout">
               {prompts.length > 0 ? (
                 prompts.map((promptGroup, groupIdx) => {
-                  // If it's the old format with a single prompt, wrap it in an array
                   const slidePrompts = promptGroup.prompts || [promptGroup.prompt];
                   const currentSlideIdx = activeSlide[groupIdx] || 0;
                   const promptText = slidePrompts[currentSlideIdx];
-                  const uniqueIdx = groupIdx * 100 + currentSlideIdx; // Unique ID for state tracking
+                  const uniqueIdx = groupIdx * 100 + currentSlideIdx; 
                   const isMultiSlide = slidePrompts.length > 1;
                   
                   return (
@@ -1702,14 +1537,6 @@ Keep everything exactly the same only enhance quality.`);
                           {promptGroup.title}
                         </span>
                         <div className="flex gap-2 items-center">
-                          <button
-                            onClick={() => handleGenerateImage(promptText, uniqueIdx, promptGroup.seed)}
-                            disabled={isGeneratingImage[uniqueIdx]}
-                            className={`p-2 hover:bg-white/5 rounded-full transition-colors disabled:opacity-50 ${copiedIndices.includes(uniqueIdx) ? 'text-green-400' : 'text-[#00f0ff]'}`}
-                            title="Generate Image"
-                          >
-                            {isGeneratingImage[uniqueIdx] ? <Loader2 className="animate-spin" size={16} /> : <ImageIcon size={16} />}
-                          </button>
                           <button
                             onClick={() => copyToClipboard(promptText, uniqueIdx)}
                             className={`p-2 hover:bg-white/5 rounded-full transition-colors ${copiedIndices.includes(uniqueIdx) ? 'text-green-400' : 'text-[#00f0ff]'}`}
@@ -1732,32 +1559,6 @@ Keep everything exactly the same only enhance quality.`);
                           ))}
                         </div>
                       )}
-                      
-                      {generatedImages[uniqueIdx] && (
-                        <motion.div 
-                          key={`img-${uniqueIdx}`}
-                          initial={{ opacity: 0, y: 10 }}
-                          animate={{ opacity: 1, y: 0 }}
-                          className="mb-4 relative group"
-                        >
-                          <img 
-                            src={generatedImages[uniqueIdx].url} 
-                            alt={`${promptGroup.title} - ${currentSlideIdx + 1}`} 
-                            className="w-full rounded-2xl border border-white/20 shadow-lg relative z-10"
-                          />
-                          <button 
-                            onClick={() => {
-                              const link = document.createElement('a');
-                              link.href = generatedImages[uniqueIdx].url;
-                              link.download = `image-${uniqueIdx}.png`;
-                              link.click();
-                            }}
-                            className="absolute bottom-2 right-2 bg-black/50 backdrop-blur-md p-2 rounded-full text-white opacity-0 group-hover:opacity-100 transition-opacity z-20"
-                          >
-                            <Upload size={14} className="rotate-180" />
-                          </button>
-                        </motion.div>
-                      )}
 
                       <div className="flex-grow overflow-y-auto max-h-60 custom-scrollbar relative">
                         <AnimatePresence mode="wait">
@@ -1778,9 +1579,9 @@ Keep everything exactly the same only enhance quality.`);
                 })
               ) : (
                   <div className="col-span-full h-96 flex flex-col items-center justify-center text-white/20 border-2 border-dashed border-white/10 rounded-[40px]">
-                    <ImageIcon size={48} strokeWidth={1} />
+                    <Type size={48} strokeWidth={1} />
                     <p className="mt-4 font-serif italic text-center px-6">
-                      Prompts will appear here. Click the <ImageIcon size={14} className="inline mx-1" /> icon on any card to generate the actual image.
+                      Prompts will appear here.
                     </p>
                   </div>
               )}
@@ -1789,7 +1590,5 @@ Keep everything exactly the same only enhance quality.`);
         </section>
       </main>
     </div>
-  </div>
   );
 }
-
