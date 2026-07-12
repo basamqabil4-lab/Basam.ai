@@ -3,7 +3,13 @@ import { GoogleGenAI, GenerateContentResponse, ThinkingLevel } from "@google/gen
 // ==========================================
 // 🔄 API KEY ROTATION SETUP
 // ==========================================
-const keysString = import.meta.env.VITE_GEMINI_API_KEYS || "";
+// بەکارهێنانی (import.meta as any) بۆ ئەوەی تایپسکریپت کێشە دروست نەکات لە کاتی بێڵدکردن لە Vercel
+let keysString = "";
+try {
+  if (typeof import.meta !== 'undefined' && (import.meta as any).env) {
+    keysString = (import.meta as any).env.VITE_GEMINI_API_KEYS || "";
+  }
+} catch (e) {}
 
 const apiKeys = keysString
   .split(',')
