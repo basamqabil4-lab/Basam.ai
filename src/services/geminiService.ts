@@ -1,15 +1,49 @@
 import { GoogleGenAI, GenerateContentResponse, ThinkingLevel } from "@google/genai";
 
+// ==========================================
+// 🔄 API KEY ROTATION SETUP
+// ==========================================
+// بەکارهێنانی (import.meta as any) بۆ ئەوەی تایپسکریپت کێشە دروست نەکات لە کاتی بێڵدکردن لە Vercel
+let keysString = "";
+try {
+  if (typeof import.meta !== 'undefined' && (import.meta as any).env) {
+    keysString = (import.meta as any).env.VITE_GEMINI_API_KEYS || "";
+  }
+} catch (e) {}
+
+const apiKeys = keysString
+  .split(',')
+  .map((key: string) => key.trim())
+  .filter((key: string) => key.length > 0);
+
+let currentKeyIndex = 0;
+
+function getCurrentKey(): string {
+  if (apiKeys.length === 0) {
+    throw new Error("VITE_GEMINI_API_KEYS is missing! Please check Vercel Environment Variables.");
+  }
+  return apiKeys[currentKeyIndex];
+}
+
+function rotateKey() {
+  if (apiKeys.length > 1) {
+    currentKeyIndex = (currentKeyIndex + 1) % apiKeys.length;
+    console.warn(`⚠️ API Key rotated to index ${currentKeyIndex + 1}`);
+  }
+}
+
 // Utility function to handle API calls with exponential backoff for quota errors
-async function withRetry<T>(operation: () => Promise<T>, maxRetries = 6, baseDelay = 2000): Promise<T> {
+async function withRetry<T>(operation: () => Promise<T>): Promise<T> {
+  // تەنها بە ژمارەی کلیلەکان هەوڵ دەدات بۆ ئەوەی داواکارییەکان نەبنە سپام
+  const maxRetries = Math.max(1, apiKeys.length);
   let attempt = 0;
+  
   while (attempt < maxRetries) {
     try {
       return await operation();
     } catch (error: any) {
       attempt++;
       
-      // Better error detection for quota issues
       const errorStr = JSON.stringify(error).toLowerCase();
       const isQuotaError = 
         error?.message?.toLowerCase().includes("quota exceeded") || 
@@ -24,21 +58,23 @@ async function withRetry<T>(operation: () => Promise<T>, maxRetries = 6, baseDel
         errorStr.includes("resource_exhausted");
                            
       if (isQuotaError && attempt < maxRetries) {
-        // Exponential backoff with jitter
-        const delay = baseDelay * Math.pow(2, attempt - 1) + Math.random() * 1000;
-        console.warn(`Quota exceeded. Retrying in ${Math.round(delay)}ms... (Attempt ${attempt} of ${maxRetries})`);
-        await new Promise(resolve => setTimeout(resolve, delay));
+        rotateKey(); // گۆڕینی کلیل لە کاتی تەواوبوونی لیمیت
+        // وەستان بۆ ماوەی ٢ چرکە پێش بەکارهێنانی کلیلی نوێ
+        await new Promise(resolve => setTimeout(resolve, 2000));
       } else {
-        // If it's a quota error but we've reached max retries, throw a clearer error
         if (isQuotaError) {
-          throw new Error("QUOTA_EXHAUSTED: You have reached the API rate limit. Please wait a moment before trying again.");
+          throw new Error("QUOTA_EXHAUSTED: لیمیتی هەموو API Keyـیەکانت تەواو بووە، تکایە دواتر هەوڵ بدەرەوە یان کلیلی ئەکاونتێکی تر دابنێ.");
         }
         throw error;
       }
     }
   }
-  throw new Error("Max retries reached or Quota fully exhausted");
+  throw new Error("بەداخەوە لیمیتی هەموو کلیلەکان تەواو بووە.");
 }
+
+// ==========================================
+// 🚀 PROMPT GENERATOR FUNCTIONS (TEXT ONLY)
+// ==========================================
 
 export interface PromptRequest {
   data: string[];
@@ -81,10 +117,8 @@ export async function generateInfographicPrompts(request: PromptRequest, customM
     'purple-special': { title: 'Purple Special', desc: 'A professional, easy-to-understand infographic with a slightly dark purple background. The typography and visual elements must strictly use a color palette of white, purple, pink, and blue.' }
   };
 
-  // Determine styles to generate
   const stylesToGenerate: { title: string; description: string; image?: string }[] = [];
 
-  // 1. Add selected preset styles
   if (request.selectedStyles && request.selectedStyles.length > 0) {
     request.selectedStyles.forEach(styleId => {
       if (presetStyleMap[styleId]) {
@@ -96,7 +130,6 @@ export async function generateInfographicPrompts(request: PromptRequest, customM
     });
   }
 
-  // 2. Add uploaded images
   if (request.styleImages && request.styleImages.length > 0) {
     request.styleImages.forEach((img, idx) => {
       stylesToGenerate.push({ 
@@ -107,14 +140,12 @@ export async function generateInfographicPrompts(request: PromptRequest, customM
     });
   }
 
-  // 3. If nothing selected/uploaded, use a single General style instead of all presets
   if (stylesToGenerate.length === 0) {
     stylesToGenerate.push({ 
       title: request.bgPresetName ? `Preset ${request.bgPresetName.toUpperCase()}` : 'General Style', 
       description: 'A professional and clean data visualization style that focuses on clarity and modern aesthetics.' 
     });
   } else if (request.bgPresetName) {
-    // Append BG Preset name to selected styles
     stylesToGenerate.forEach(style => {
       style.title = `${style.title} + ${request.bgPresetName.toUpperCase()}`;
     });
@@ -195,7 +226,7 @@ export async function generateInfographicPrompts(request: PromptRequest, customM
       
       ${request.bgPresetImage ? "CRITICAL INSTRUCTION: I have provided a BACKGROUND PRESET image. Your prompt MUST explicitly instruct the image generator to use this image EXACTLY as the background. If there are people or characters in the other provided reference images, they MUST be placed on this background EXACTLY as they appear (100% identical faces, features, and poses, with NO distortion). The blending MUST be flawless, hyper-realistic, and highly accurate. Adjust the lighting, shadows, reflections, and color balance of the characters so they look like they naturally belong in the background preset. Ensure perfect perspective and scale. Do not add any other complex elements; keep the focus on the background and the characters." : ""}
       
-      CRITICAL REQUIREMENTS FOR GEMINI 3.1 FLASH IMAGE (NANO BANANA 2):
+      CRITICAL REQUIREMENTS FOR GEMINI 3.1 FLASH IMAGE:
       1. PROMPT STYLE: Use descriptive, immersive natural language. Start with: "A stunning, high-definition professional infographic..." or "A precise, photorealistic geographic map visualization...".
       2. DATA LAYOUT: Use the provided data to determine the exact layout, hierarchy, and number of elements. Explicitly include the text, numbers, and labels from the data in your prompt description.
       3. LOGICAL LAYOUT (RTL & CENTERED): Organize elements in a logical, balanced flow starting from the RIGHT side and moving to the LEFT (Right-to-Left direction). The overall composition MUST be centered and balanced on the canvas. Use "symmetrical composition," "golden ratio alignment," and "clear visual hierarchy."
@@ -224,24 +255,20 @@ export async function generateInfographicPrompts(request: PromptRequest, customM
     };
 
     try {
-      // Initialize AI inside the loop to ensure fresh context
-      const aiInstance = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || process.env.API_KEY || "" });
-      
       const contents: any = { parts: [textPart] };
-      if (imagePart) {
-        contents.parts.unshift(imagePart);
-      }
-      if (bgPresetPart) {
-        contents.parts.unshift(bgPresetPart);
-      }
+      if (imagePart) contents.parts.unshift(imagePart);
+      if (bgPresetPart) contents.parts.unshift(bgPresetPart);
 
-      const response: GenerateContentResponse = await withRetry(() => aiInstance.models.generateContent({
-        model: model,
-        contents: contents,
-        config: {
-          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW }
-        }
-      }));
+      const response: GenerateContentResponse = await withRetry(() => {
+        const aiInstance = new GoogleGenAI({ apiKey: getCurrentKey() });
+        return aiInstance.models.generateContent({
+          model: model,
+          contents: contents,
+          config: {
+            thinkingConfig: { thinkingLevel: ThinkingLevel.LOW }
+          }
+        });
+      });
 
       if (!response.text) {
         results.push({
@@ -252,12 +279,8 @@ export async function generateInfographicPrompts(request: PromptRequest, customM
         });
       } else {
         let text = response.text.trim();
-        // Remove markdown code blocks if present
-        if (text.startsWith('```json')) {
-          text = text.replace(/^```json\n/, '').replace(/\n```$/, '');
-        } else if (text.startsWith('```')) {
-          text = text.replace(/^```\n/, '').replace(/\n```$/, '');
-        }
+        if (text.startsWith('```json')) text = text.replace(/^```json\n/, '').replace(/\n```$/, '');
+        else if (text.startsWith('```')) text = text.replace(/^```\n/, '').replace(/\n```$/, '');
         
         try {
           const parsed = JSON.parse(text);
@@ -268,19 +291,13 @@ export async function generateInfographicPrompts(request: PromptRequest, customM
           if (Array.isArray(parsed) && parsed.length > 0 && parsed[0].prompts && Array.isArray(parsed[0].prompts)) {
             promptsArray = parsed[0].prompts.map((p: string, i: number) => {
               let slidePrompt = p.trim();
-              if (!slidePrompt.includes(exactStyle)) {
-                slidePrompt += `\n\n${exactStyle}`;
-              }
+              if (!slidePrompt.includes(exactStyle)) slidePrompt += `\n\n${exactStyle}`;
               return slidePrompt;
             });
-            
             finalPrompt = promptsArray.map((p, i) => `[ SLIDE ${i + 1} ]\n${p}`).join('\n\n');
           } else {
-            // Fallback if not matching expected structure
             finalPrompt = text;
-            if (!finalPrompt.includes(exactStyle)) {
-              finalPrompt += `\n\n${exactStyle}`;
-            }
+            if (!finalPrompt.includes(exactStyle)) finalPrompt += `\n\n${exactStyle}`;
             promptsArray = [finalPrompt];
           }
           
@@ -292,12 +309,9 @@ export async function generateInfographicPrompts(request: PromptRequest, customM
           });
         } catch (e) {
           console.error("Failed to parse JSON in infographic prompts", e);
-          // Fallback to raw text
           let finalPrompt = text;
           const exactStyle = `Style: ${baseStyleInstruction}${styleDescription}`;
-          if (!finalPrompt.includes(exactStyle)) {
-            finalPrompt += `\n\n${exactStyle}`;
-          }
+          if (!finalPrompt.includes(exactStyle)) finalPrompt += `\n\n${exactStyle}`;
           results.push({
             title: styleConfig.title,
             prompt: finalPrompt,
@@ -308,28 +322,16 @@ export async function generateInfographicPrompts(request: PromptRequest, customM
       }
     } catch (error: any) {
       console.error(`Error generating prompt for style ${styleConfig.title}:`, error);
-      let errorMessage = "Error generating prompt for this style.";
-      
-      if (error?.message?.includes("API_KEY_INVALID")) {
-        errorMessage = "Invalid API Key. Please check your configuration.";
-      } else if (error?.message?.includes("Quota exceeded") || error?.message?.includes("429")) {
-        errorMessage = "Quota exceeded (Free Tier). Please wait a moment and try again.";
-      } else if (error?.message?.includes("safety")) {
-        errorMessage = "The content was flagged by safety filters. Please try more neutral language.";
-      } else if (error?.message) {
-        errorMessage = `API Error: ${error.message}`;
-      }
-      
       results.push({
         title: styleConfig.title,
-        prompt: errorMessage,
-        prompts: [errorMessage],
+        prompt: `API Error: ${error.message}`,
+        prompts: [`API Error: ${error.message}`],
         seed: Math.floor(Math.random() * 1000000)
       });
     }
     
-    // Add a small delay between requests to avoid hitting rate limits too quickly
-    await new Promise(resolve => setTimeout(resolve, 800));
+    // پشوودان بۆ ماوەی ٢.٥ چرکە لە نێوان ناردنی ستایلەکان بۆ ئەوەی بلۆک نەبێت
+    await new Promise(resolve => setTimeout(resolve, 2500));
   }
 
   return results;
@@ -352,7 +354,6 @@ export interface ImageToPromptRequest {
 
 export async function generateImageToPromptPrompts(request: ImageToPromptRequest, customModel?: string): Promise<PromptResult[]> {
   const model = customModel || "gemini-3-flash-preview";
-  const aiInstance = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || process.env.API_KEY || "" });
 
   const presetStyleMap: Record<string, { title: string; desc: string }> = {
     'cyber-map': { title: 'Cyber Map', desc: 'Futuristic tactical UI with glowing lines, data points, and a dark blue/cyan aesthetic.' },
@@ -395,12 +396,7 @@ export async function generateImageToPromptPrompts(request: ImageToPromptRequest
   if (request.styleImages && request.styleImages.length > 0) {
     styleInstruction += " I have also provided additional reference images. You MUST incorporate their visual style, color palette, and lighting into your final prompt description.";
     request.styleImages.forEach((img) => {
-      imageParts.push({
-        inlineData: {
-          mimeType: "image/png",
-          data: img.split(",")[1],
-        },
-      });
+      imageParts.push({ inlineData: { mimeType: "image/png", data: img.split(",")[1] } });
     });
   }
 
@@ -423,25 +419,23 @@ export async function generateImageToPromptPrompts(request: ImageToPromptRequest
   };
 
   const mainImagePart = {
-    inlineData: {
-      mimeType: "image/png",
-      data: request.image.split(",")[1],
-    },
+    inlineData: { mimeType: "image/png", data: request.image.split(",")[1] },
   };
 
   try {
-    const response = await withRetry(() => aiInstance.models.generateContent({
-      model: model,
-      contents: { parts: [mainImagePart, ...imageParts, textPart] },
-      config: {
-        responseMimeType: "application/json",
-        thinkingConfig: { thinkingLevel: ThinkingLevel.LOW }
-      }
-    }));
+    const response = await withRetry(() => {
+      const aiInstance = new GoogleGenAI({ apiKey: getCurrentKey() });
+      return aiInstance.models.generateContent({
+        model: model,
+        contents: { parts: [mainImagePart, ...imageParts, textPart] },
+        config: {
+          responseMimeType: "application/json",
+          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW }
+        }
+      });
+    });
 
-    if (!response.text) {
-      return [{ title: "Error", prompt: "Failed to generate prompt from image." }];
-    }
+    if (!response.text) return [{ title: "Error", prompt: "Failed to generate prompt from image." }];
 
     try {
       const parsed = JSON.parse(response.text);
@@ -457,7 +451,6 @@ export async function generateImageToPromptPrompts(request: ImageToPromptRequest
       console.error("Failed to parse JSON", e);
       return [{ title: "Raw Output", prompt: response.text }];
     }
-
   } catch (error: any) {
     console.error("Error generating image-to-prompt:", error);
     return [{ title: "Error", prompt: `API Error: ${error.message}` }];
@@ -480,7 +473,6 @@ export interface FHDPromptRequest {
 
 export async function generateFHDPrompts(request: FHDPromptRequest, customModel?: string): Promise<PromptResult[]> {
   const model = customModel || "gemini-3-flash-preview";
-  const aiInstance = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || process.env.API_KEY || "" });
 
   let imageInstruction = "";
   let imageParts: any[] = [];
@@ -496,12 +488,7 @@ export async function generateFHDPrompts(request: FHDPromptRequest, customModel?
       imageInstruction = `I have provided ${numImages} reference image(s). Your prompt MUST explicitly instruct the image generator to combine ALL ${numImages} subjects/elements into ONE SINGLE cohesive scene, ${distanceText}. Use them as inspiration for the style and subjects, but you have creative freedom to alter poses, faces, or details as needed to make them fit naturally and closely together in one image.`;
     }
     request.images.forEach((img) => {
-      imageParts.push({
-        inlineData: {
-          mimeType: "image/png",
-          data: img.split(",")[1],
-        },
-      });
+      imageParts.push({ inlineData: { mimeType: "image/png", data: img.split(",")[1] } });
     });
   }
 
@@ -512,12 +499,7 @@ export async function generateFHDPrompts(request: FHDPromptRequest, customModel?
     bgInstruction = `CRITICAL INSTRUCTION: You MUST use the following exact description for the background of the image: "${B1_PROMPT}". Place the subjects/characters directly into this background, matching the lighting and perspective seamlessly.`;
   } else if (request.bgPresetImage) {
     bgInstruction = "CRITICAL INSTRUCTION: I have provided a BACKGROUND PRESET image. You MUST use this exact image as the actual background of the final generated image. Place the subjects/characters directly into this background, matching the lighting and perspective seamlessly. DO NOT use a black or plain background.";
-    imageParts.push({
-      inlineData: {
-        mimeType: "image/png",
-        data: request.bgPresetImage.split(",")[1],
-      },
-    });
+    imageParts.push({ inlineData: { mimeType: "image/png", data: request.bgPresetImage.split(",")[1] } });
   }
 
   let safeZoneInstruction = "";
@@ -571,40 +553,32 @@ export async function generateFHDPrompts(request: FHDPromptRequest, customModel?
     ${request.bgPresetName ? `\n    IMPORTANT: Since the user selected the background preset "${request.bgPresetName.toUpperCase()}", you MUST include "${request.bgPresetName.toUpperCase()}" in the title of each generated prompt.` : ""}
     
     Example output format:
-    ${hasImages ? `[
-      { "title": "Combined Scene${request.bgPresetName ? ` + ${request.bgPresetName.toUpperCase()}` : ""}", "prompt": "A stunning..." }
-    ]` : `[
-      { "title": "Option 1${request.bgPresetName ? ` + ${request.bgPresetName.toUpperCase()}` : ""}", "prompt": "A stunning..." },
-      { "title": "Option 2${request.bgPresetName ? ` + ${request.bgPresetName.toUpperCase()}` : ""}", "prompt": "A breathtaking..." }
-    ]`}
+    ${hasImages ? `[ { "title": "Combined Scene${request.bgPresetName ? ` + ${request.bgPresetName.toUpperCase()}` : ""}", "prompt": "A stunning..." } ]` : `[ { "title": "Option 1", "prompt": "A stunning..." }, { "title": "Option 2", "prompt": "A breathtaking..." } ]`}
     
     Generate ONLY the JSON array. No markdown formatting, no meta-talk.`,
   };
 
   try {
-    const contents: any = { parts: [...imageParts, textPart] };
+    const response = await withRetry(() => {
+      const aiInstance = new GoogleGenAI({ apiKey: getCurrentKey() });
+      return aiInstance.models.generateContent({
+        model: model,
+        contents: { parts: [...imageParts, textPart] },
+        config: {
+          responseMimeType: "application/json",
+          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW }
+        }
+      });
+    });
 
-    const response = await withRetry(() => aiInstance.models.generateContent({
-      model: model,
-      contents: contents,
-      config: {
-        responseMimeType: "application/json",
-        thinkingConfig: { thinkingLevel: ThinkingLevel.LOW }
-      }
-    }));
-
-    if (!response.text) {
-      return [{ title: "Error", prompt: "Failed to generate prompts." }];
-    }
+    if (!response.text) return [{ title: "Error", prompt: "Failed to generate prompts." }];
 
     try {
-      const parsed = JSON.parse(response.text);
-      return parsed;
+      return JSON.parse(response.text);
     } catch (e) {
       console.error("Failed to parse JSON", e);
       return [{ title: "Raw Output", prompt: response.text }];
     }
-
   } catch (error: any) {
     console.error("Error generating FHD prompts:", error);
     return [{ title: "Error", prompt: `API Error: ${error.message}` }];
@@ -625,8 +599,7 @@ export interface BackgroundPromptRequest {
 }
 
 export async function generateBackgroundPrompts(request: BackgroundPromptRequest, customModel?: string): Promise<PromptResult[]> {
-  const model = customModel || "gemini-3-flash-preview"; // Using Flash for better quota limits
-  const aiInstance = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || process.env.API_KEY || "" });
+  const model = customModel || "gemini-3-flash-preview";
 
   let styleInstruction = "";
   if (request.style === 'realistic') {
@@ -642,12 +615,7 @@ export async function generateBackgroundPrompts(request: BackgroundPromptRequest
   if (request.images && request.images.length > 0) {
     imageInstruction = "I have provided reference images. Your prompt MUST describe how to seamlessly blend these images together while maintaining their realistic forms and features. Provide an incredibly detailed description of the elements in these images so the image generator can recreate and blend them perfectly.";
     request.images.forEach((img) => {
-      imageParts.push({
-        inlineData: {
-          mimeType: "image/png",
-          data: img.split(",")[1],
-        },
-      });
+      imageParts.push({ inlineData: { mimeType: "image/png", data: img.split(",")[1] } });
     });
   }
 
@@ -678,192 +646,35 @@ export async function generateBackgroundPrompts(request: BackgroundPromptRequest
     
     Generate the output as a JSON array of objects, where each object has a "title" (a short, catchy title) and a "prompt" (the highly detailed image generation prompt in English).
     
-    Example output format:
-    [
-      { "title": "Option 1", "prompt": "A stunning..." },
-      { "title": "Option 2", "prompt": "A breathtaking..." }
-    ]
-    
     Generate ONLY the JSON array. No markdown formatting, no meta-talk.`,
   };
 
   try {
-    const contents: any = { parts: [...imageParts, textPart] };
+    const response = await withRetry(() => {
+      const aiInstance = new GoogleGenAI({ apiKey: getCurrentKey() });
+      return aiInstance.models.generateContent({
+        model: model,
+        contents: { parts: [...imageParts, textPart] },
+        config: {
+          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW }
+        }
+      });
+    });
 
-    const response = await withRetry(() => aiInstance.models.generateContent({
-      model: model,
-      contents: contents,
-      config: {
-        tools: [{ googleSearch: {} }], // Enable search for accurate location details
-        responseMimeType: "application/json",
-        thinkingConfig: { thinkingLevel: ThinkingLevel.LOW }
-      }
-    }));
+    if (!response.text) return [{ title: "Error", prompt: "Failed to generate prompts." }];
 
-    if (!response.text) {
-      return [{ title: "Error", prompt: "Failed to generate prompts." }];
-    }
+    let text = response.text.trim();
+    if (text.startsWith('```json')) text = text.replace(/^```json\n/, '').replace(/\n```$/, '');
+    else if (text.startsWith('```')) text = text.replace(/^```\n/, '').replace(/\n```$/, '');
 
     try {
-      const parsed = JSON.parse(response.text);
-      return parsed;
+      return JSON.parse(text);
     } catch (e) {
       console.error("Failed to parse JSON", e);
-      return [{ title: "Raw Output", prompt: response.text }];
+      return [{ title: "Raw Output", prompt: text }];
     }
-
   } catch (error: any) {
     console.error("Error generating background prompts:", error);
     return [{ title: "Error", prompt: `API Error: ${error.message}` }];
-  }
-}
-
-export async function generateImageFromPrompt(prompt: string, aspectRatio: string, highQuality: boolean = false, mode: 'infographic' | 'background' | 'fhd' = 'infographic', customText?: string, referenceImages?: string[], keepOriginal?: boolean, bgPresetImage?: string | null, subjectDistance?: number, seed?: number): Promise<string> {
-  const model = highQuality ? "gemini-3.1-flash-image-preview" : "gemini-2.5-flash-image";
-  
-  let finalPrompt = prompt;
-  if (mode === 'infographic') {
-    finalPrompt += "\n\nCRITICAL INSTRUCTION: The image must be a BLANK TEMPLATE. Do not include any actual text characters, words, letters, or digits. Instead, leave clean, empty placeholder boxes, blank stylized lines, or clear empty spaces exactly where the text and data should be placed. The composition must be perfectly prepared for manual text overlay.";
-    if (bgPresetImage) {
-      finalPrompt += "\n\nCRITICAL INSTRUCTION: I have provided a BACKGROUND PRESET image. You MUST use this exact image as the actual background of the final generated image. Place the foreground elements directly into this background with FLAWLESS, HYPER-REALISTIC BLENDING. Match the lighting, shadows, reflections, color grading, and perspective perfectly so the subjects look like they naturally exist in that environment. DO NOT use a black or plain background.";
-    }
-  } else if (mode === 'background') {
-    if (customText) {
-      finalPrompt += `\n\nCRITICAL INSTRUCTION: You MUST render the exact text "${customText}" prominently and beautifully on the image. Do not add any other random text.`;
-    } else {
-      finalPrompt += "\n\nCRITICAL INSTRUCTION: DO NOT generate any text, letters, or words on the image. Keep it completely text-free.";
-    }
-  } else if (mode === 'fhd') {
-    const numRefs = referenceImages ? referenceImages.length : 0;
-    const distanceText = subjectDistance && subjectDistance > 0
-      ? `place them approximately ${subjectDistance}% apart from each other`
-      : `place them EXTREMELY CLOSE together (e.g., standing shoulder-to-shoulder, forming a tight group)`;
-      
-    if (keepOriginal) {
-      finalPrompt = `CRITICAL INSTRUCTION: I have provided ${numRefs} reference image(s). You are acting as a BACKGROUND REPLACEMENT and COMPOSITION tool. You MUST NOT alter, redraw, or modify the subjects/persons from the reference images in ANY WAY. Their faces, expressions, clothing, poses, proportions, and lighting MUST REMAIN 100% IDENTICAL to the original images. Your ONLY task is to extract them exactly as they are, ${distanceText}, and place them on a new background matching the following description:\n\n${prompt}`;
-      if (bgPresetImage) {
-        finalPrompt = `CRITICAL INSTRUCTION: I have provided ${numRefs} reference image(s) of subjects and 1 background preset image. You are acting as a BACKGROUND REPLACEMENT and COMPOSITION tool. You MUST NOT alter, redraw, or modify the subjects/persons from the reference images in ANY WAY. Their faces, expressions, clothing, poses, proportions, and lighting MUST REMAIN 100% IDENTICAL to the original images. Your ONLY task is to extract them exactly as they are, ${distanceText}, AND place them on the provided background preset. Blend them flawlessly into the new background without changing the subjects themselves.\n\nAdditional details: ${prompt}`;
-      }
-    } else {
-      finalPrompt += `\n\nCRITICAL INSTRUCTION: I have provided ${numRefs} reference image(s). You MUST combine ALL subjects/elements from the reference images into ONE SINGLE cohesive image, ${distanceText}. Use the reference images as inspiration, but you may alter the characters, poses, and features to fit the prompt and make them interact naturally and closely. `;
-      if (bgPresetImage) {
-        finalPrompt += "\n\nCRITICAL INSTRUCTION: I have provided a BACKGROUND PRESET image. You MUST use this exact image as the actual background of the final generated image. Place the foreground elements directly into this background with FLAWLESS, HYPER-REALISTIC BLENDING. Match the lighting, shadows, reflections, color grading, and perspective perfectly so the subjects look like they naturally exist in that environment. DO NOT use a black or plain background.";
-      }
-    }
-    finalPrompt += `\n\nCRITICAL QUALITY INSTRUCTION: Ensure flawless human anatomy, perfect proportions, highly detailed symmetrical faces, and NO deformations. The image must be perfectly framed and aligned for the exact requested aspect ratio (${aspectRatio}) without cropping important elements.`;
-    if (customText) {
-      finalPrompt += `\n\nYou MUST render the exact text "${customText}" prominently and beautifully on the design. Do not add any other random text.`;
-    } else {
-      finalPrompt += "\n\nDO NOT generate any text, letters, or words on the image. Keep it completely text-free.";
-    }
-  }
-
-  try {
-    const config: any = {
-      imageConfig: {
-        aspectRatio: aspectRatio as any,
-      },
-    };
-
-    if (seed !== undefined) {
-      config.seed = seed;
-    }
-
-    if (highQuality) {
-      config.imageConfig.imageSize = mode === 'fhd' ? "4K" : "1K";
-    }
-
-    const parts: any[] = [];
-    if (bgPresetImage && (mode === 'infographic' || mode === 'fhd')) {
-      parts.push({
-        inlineData: {
-          mimeType: "image/png",
-          data: bgPresetImage.split(",")[1],
-        }
-      });
-    }
-    if (referenceImages && referenceImages.length > 0) {
-      referenceImages.forEach(img => {
-        parts.push({
-          inlineData: {
-            mimeType: "image/png",
-            data: img.split(",")[1],
-          }
-        });
-      });
-    }
-    parts.push({ text: finalPrompt });
-
-    const aiInstance = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || process.env.API_KEY || "" });
-    const response = await withRetry(() => aiInstance.models.generateContent({
-      model: model,
-      contents: {
-        parts: parts,
-      },
-      config: config,
-    }));
-
-    for (const part of response.candidates[0].content.parts) {
-      if (part.inlineData) {
-        return `data:image/png;base64,${part.inlineData.data}`;
-      }
-    }
-    throw new Error("No image data returned from Gemini.");
-  } catch (error) {
-    console.error("Error generating image:", error);
-    throw error;
-  }
-}
-
-export async function enhanceImage(base64Image: string, aspectRatio: string = "1:1", isHighQuality: boolean = true): Promise<string> {
-  const model = isHighQuality ? "gemini-3.1-flash-image-preview" : "gemini-2.5-flash-image";
-  const prompt = `Ultra-premium professional image enhancement.
-Transform the uploaded low-quality, blurry image into extreme high-detail cinematic quality.
-Preserve 100% original identity, face structure, expression, pose, clothing, accessories, background, framing, and composition.
-Do NOT alter, redesign, replace, or add anything.
-Recover micro-details:
-sharp facial features
-natural skin texture
-visible pores
-realistic hair strands
-crisp eyes
-clean refined edges
-High-contrast clarity, deep depth, and balanced cinematic lighting. Poster-grade realism with dramatic but accurate detail.
-Output in 8K resolution, ProRes quality, studio-level sharpness.
-Photorealistic textures only. True-to-source enhancement only.
-Keep everything exactly the same only enhance quality.`;
-
-  try {
-    const aiInstance = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || process.env.API_KEY || "" });
-    const response = await withRetry(() => aiInstance.models.generateContent({
-      model: model,
-      contents: {
-        parts: [
-          {
-            inlineData: {
-              mimeType: "image/png",
-              data: base64Image.split(",")[1],
-            }
-          },
-          { text: prompt }
-        ],
-      },
-      config: {
-        imageConfig: {
-          aspectRatio: aspectRatio as any,
-          imageSize: isHighQuality ? "4K" : "1K",
-        }
-      }
-    }));
-
-    for (const part of response.candidates[0].content.parts) {
-      if (part.inlineData) {
-        return `data:image/png;base64,${part.inlineData.data}`;
-      }
-    }
-    throw new Error("No image data returned from Gemini.");
-  } catch (error) {
-    console.error("Error enhancing image:", error);
-    throw error;
   }
 }
