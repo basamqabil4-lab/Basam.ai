@@ -656,8 +656,6 @@ export async function generateBackgroundPrompts(request: BackgroundPromptRequest
         model: model,
         contents: { parts: [...imageParts, textPart] },
         config: {
-          tools: [{ googleSearch: {} }],
-          responseMimeType: "application/json",
           thinkingConfig: { thinkingLevel: ThinkingLevel.LOW }
         }
       });
@@ -665,11 +663,15 @@ export async function generateBackgroundPrompts(request: BackgroundPromptRequest
 
     if (!response.text) return [{ title: "Error", prompt: "Failed to generate prompts." }];
 
+    let text = response.text.trim();
+    if (text.startsWith('```json')) text = text.replace(/^```json\n/, '').replace(/\n```$/, '');
+    else if (text.startsWith('```')) text = text.replace(/^```\n/, '').replace(/\n```$/, '');
+
     try {
-      return JSON.parse(response.text);
+      return JSON.parse(text);
     } catch (e) {
       console.error("Failed to parse JSON", e);
-      return [{ title: "Raw Output", prompt: response.text }];
+      return [{ title: "Raw Output", prompt: text }];
     }
   } catch (error: any) {
     console.error("Error generating background prompts:", error);
