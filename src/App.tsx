@@ -1590,5 +1590,6 @@ Keep everything exactly the same only enhance quality.`);
         </section>
       </main>
     </div>
+    </div>
   );
 }
