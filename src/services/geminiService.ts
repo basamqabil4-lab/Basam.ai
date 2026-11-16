@@ -1,80 +1,333 @@
-import { GoogleGenAI, GenerateContentResponse, ThinkingLevel } from "@google/genai";
+import { GoogleGenAI, GenerateContentResponse, ThinkingLevel } from '@google/genai';
+import { DEFAULT_MODEL, StyleType, ThinkingPreset } from '../constants/options';
+import { dataUrlToInlinePart, InlineImagePart } from '../utils/imageUtils';
 
 // ==========================================
-// 🔄 API KEY ROTATION SETUP
+// API KEY ROTATION & ENV RESOLUTION
 // ==========================================
-// بەکارهێنانی (import.meta as any) بۆ ئەوەی تایپسکریپت کێشە دروست نەکات لە کاتی بێڵدکردن لە Vercel
-let keysString = "";
-try {
-  if (typeof import.meta !== 'undefined' && (import.meta as any).env) {
-    keysString = (import.meta as any).env.VITE_GEMINI_API_KEYS || "";
+
+function resolveApiKeys(): string[] {
+  let rawKeys = '';
+
+  try {
+    if (typeof import.meta !== 'undefined' && (import.meta as any).env) {
+      rawKeys = (import.meta as any).env.VITE_GEMINI_API_KEYS || '';
+    }
+  } catch {
+    // Ignore env read failure
   }
-} catch (e) {}
 
-const apiKeys = keysString
-  .split(',')
-  .map((key: string) => key.trim())
-  .filter((key: string) => key.length > 0);
-
-let currentKeyIndex = 0;
-
-function getCurrentKey(): string {
-  if (apiKeys.length === 0) {
-    throw new Error("VITE_GEMINI_API_KEYS is missing! Please check Vercel Environment Variables.");
-  }
-  return apiKeys[currentKeyIndex];
-}
-
-function rotateKey() {
-  if (apiKeys.length > 1) {
-    currentKeyIndex = (currentKeyIndex + 1) % apiKeys.length;
-    console.warn(`⚠️ API Key rotated to index ${currentKeyIndex + 1}`);
-  }
-}
-
-// Utility function to handle API calls with exponential backoff for quota errors
-async function withRetry<T>(operation: () => Promise<T>): Promise<T> {
-  // تەنها بە ژمارەی کلیلەکان هەوڵ دەدات بۆ ئەوەی داواکارییەکان نەبنە سپام
-  const maxRetries = Math.max(1, apiKeys.length);
-  let attempt = 0;
-  
-  while (attempt < maxRetries) {
+  if (!rawKeys) {
     try {
-      return await operation();
-    } catch (error: any) {
-      attempt++;
-      
-      const errorStr = JSON.stringify(error).toLowerCase();
-      const isQuotaError = 
-        error?.message?.toLowerCase().includes("quota exceeded") || 
-        error?.message?.includes("429") || 
-        error?.status === 429 ||
-        error?.status === "RESOURCE_EXHAUSTED" ||
-        error?.error?.code === 429 ||
-        error?.error?.status === "RESOURCE_EXHAUSTED" ||
-        errorStr.includes("quota") ||
-        errorStr.includes("429") ||
-        errorStr.includes("exhausted") ||
-        errorStr.includes("resource_exhausted");
-                           
-      if (isQuotaError && attempt < maxRetries) {
-        rotateKey(); // گۆڕینی کلیل لە کاتی تەواوبوونی لیمیت
-        // وەستان بۆ ماوەی ٢ چرکە پێش بەکارهێنانی کلیلی نوێ
-        await new Promise(resolve => setTimeout(resolve, 2000));
-      } else {
-        if (isQuotaError) {
-          throw new Error("QUOTA_EXHAUSTED: لیمیتی هەموو API Keyـیەکانت تەواو بووە، تکایە دواتر هەوڵ بدەرەوە یان کلیلی ئەکاونتێکی تر دابنێ.");
-        }
-        throw error;
+      const legacyKey = process.env.GEMINI_API_KEY || '';
+      if (legacyKey && legacyKey !== 'MY_GEMINI_API_KEY') {
+        rawKeys = legacyKey;
       }
+    } catch {
+      // Ignore process.env unavailability in browser
     }
   }
-  throw new Error("بەداخەوە لیمیتی هەموو کلیلەکان تەواو بووە.");
+
+  return rawKeys
+    .split(',')
+    .map((key: string) => key.trim())
+    .filter((key: string) => key.length > 0 && key !== 'MY_GEMINI_API_KEY');
+}
+
+let currentKeyIndex = 0;
+const keyCooldownUntil = new Map<number, number>();
+const KEY_COOLDOWN_MS = 60_000;
+
+function getApiKeys(): string[] {
+  return resolveApiKeys();
+}
+
+function selectActiveKey(keys: string[]): { key: string; index: number } {
+  const now = Date.now();
+  for (let offset = 0; offset < keys.length; offset++) {
+    const idx = (currentKeyIndex + offset) % keys.length;
+    const cooldown = keyCooldownUntil.get(idx) || 0;
+    if (now >= cooldown) {
+      currentKeyIndex = idx;
+      return { key: keys[idx], index: idx };
+    }
+  }
+  const idx = currentKeyIndex % keys.length;
+  return { key: keys[idx], index: idx };
+}
+
+function markKeyCooldown(failedIndex: number, totalKeys: number) {
+  keyCooldownUntil.set(failedIndex, Date.now() + KEY_COOLDOWN_MS);
+  if (totalKeys > 1) {
+    currentKeyIndex = (failedIndex + 1) % totalKeys;
+    console.warn(`API Key ${failedIndex + 1} hit quota; rotated to index ${currentKeyIndex + 1}`);
+  }
+}
+
+function safeErrorText(error: unknown): string {
+  if (!error) return '';
+  if (typeof error === 'string') return error;
+  const err = error as Record<string, any>;
+  const parts: string[] = [];
+  if (err.message) parts.push(String(err.message));
+  if (err.status) parts.push(String(err.status));
+  if (err.code) parts.push(String(err.code));
+  if (err.error?.message) parts.push(String(err.error.message));
+  if (err.error?.status) parts.push(String(err.error.status));
+  if (parts.length > 0) return parts.join(' ').toLowerCase();
+  try {
+    return JSON.stringify(error).toLowerCase();
+  } catch {
+    return String(error).toLowerCase();
+  }
+}
+
+function isQuotaExceededError(error: unknown): boolean {
+  const text = safeErrorText(error);
+  return (
+    text.includes('quota') ||
+    text.includes('429') ||
+    text.includes('exhausted') ||
+    text.includes('resource_exhausted')
+  );
+}
+
+function checkAborted(signal?: AbortSignal) {
+  if (signal?.aborted) {
+    throw new DOMException('Aborted', 'AbortError');
+  }
+}
+
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new DOMException('Aborted', 'AbortError'));
+      return;
+    }
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(new DOMException('Aborted', 'AbortError'));
+    };
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+async function withRetry<T>(
+  operation: (apiKey: string) => Promise<T>,
+  signal?: AbortSignal
+): Promise<T> {
+  const keys = getApiKeys();
+  if (keys.length === 0) {
+    throw new Error(
+      'API_KEY_MISSING: VITE_GEMINI_API_KEYS (or GEMINI_API_KEY) is missing in your .env.local file.'
+    );
+  }
+
+  const maxRetries = keys.length;
+
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    checkAborted(signal);
+    const { key, index } = selectActiveKey(keys);
+    try {
+      return await operation(key);
+    } catch (error: unknown) {
+      if ((error as Error)?.name === 'AbortError' || signal?.aborted) {
+        throw new DOMException('Aborted', 'AbortError');
+      }
+
+      if (isQuotaExceededError(error)) {
+        markKeyCooldown(index, keys.length);
+        if (attempt < maxRetries) {
+          await sleep(600, signal);
+          continue;
+        }
+        throw new Error(
+          'QUOTA_EXHAUSTED: All configured API keys have reached their quota limit. Please try again later or add another key.'
+        );
+      }
+      throw error;
+    }
+  }
+
+  throw new Error('QUOTA_EXHAUSTED: All configured API keys have reached their quota limit.');
 }
 
 // ==========================================
-// 🚀 PROMPT GENERATOR FUNCTIONS (TEXT ONLY)
+// SHARED PROMPT HELPERS
 // ==========================================
+
+const PRESET_STYLE_MAP: Record<string, { title: string; desc: string }> = {
+  'cyber-map': {
+    title: 'Cyber Map',
+    desc: 'Futuristic tactical UI with glowing lines, data points, and a dark blue/cyan aesthetic.',
+  },
+  'futuristic-3d': {
+    title: 'Futuristic 3D',
+    desc: 'Dark 3D presentation style with glowing spheres, deep purple gradients, and high-tech depth.',
+  },
+  'tech-landing': {
+    title: 'Tech Landing',
+    desc: 'Modern tech landing page style with glowing blue cards, clean white text, and a professional dark theme.',
+  },
+  'ai-analytics': {
+    title: 'AI Analytics',
+    desc: 'Isometric data visualization style with 3D bar charts, world maps, and AI-themed purple/blue accents.',
+  },
+  'ai-ecosystem': {
+    title: 'AI Ecosystem',
+    desc: 'Central node network style connecting various AI service logos with glowing lines and a dark, immersive background.',
+  },
+  minimalist: {
+    title: 'Minimalist',
+    desc: 'Clean, minimalist corporate style with a crisp light background and professional blue accents.',
+  },
+  vibrant: {
+    title: 'Vibrant Modern',
+    desc: 'Vibrant, high-energy modern style with bold gradients and dark mode aesthetic.',
+  },
+  editorial: {
+    title: 'Editorial',
+    desc: 'Sophisticated editorial style with refined typography and warm earth tones.',
+  },
+  'tech-grid': {
+    title: 'Tech Grid',
+    desc: 'Futuristic tech-focused style with neon highlights and subtle data-grid patterns.',
+  },
+  'purple-special': {
+    title: 'Purple Special',
+    desc: 'Professional, clear infographic with a rich dark purple background using a strict palette of white, purple, pink, and blue.',
+  },
+};
+
+function buildVisualStyleGuidance(
+  styleType?: StyleType,
+  color1?: string,
+  color2?: string,
+  bgColor?: string
+): { instruction: string; enforceColors: boolean } {
+  if (!styleType || styleType === 'original') {
+    return { instruction: '', enforceColors: false };
+  }
+
+  if (styleType === 'realistic') {
+    return {
+      instruction:
+        'Visual Medium: 100% authentic, editorial-grade photorealistic photography with natural studio or environmental lighting, genuine material textures, and balanced depth of field. Avoid flat 2D illustrations, CGI plastic sheen, or decorative overlays.',
+      enforceColors: false,
+    };
+  }
+
+  const hasColors = Boolean(color1 && color2 && bgColor);
+  const paletteClause = hasColors
+    ? ` Use ${bgColor} as the primary canvas background and strictly limit accent elements, icons, charts, and highlights to ${color1} and ${color2}.`
+    : '';
+
+  if (styleType === 'graphic') {
+    return {
+      instruction: `Visual Medium: High-end, disciplined modern 2D/3D editorial graphic design built on a clean grid with generous negative space, crisp vector/matte-3D forms, and purposeful minimalism. Avoid photorealistic photography and avoid decorative clutter.${paletteClause}`,
+      enforceColors: hasColors,
+    };
+  }
+
+  return {
+    instruction: `Visual Medium: Sophisticated hybrid of authentic photography and clean modern editorial graphic design (structured cards, crisp typographic framing, clean geometric dividers, subtle ambient depth). Keep graphics restrained and purposeful without floating particles or ornamental noise.${paletteClause}`,
+    enforceColors: hasColors,
+  };
+}
+
+const DESIGNER_RESTRAINT_RULE = `SENIOR ART DIRECTOR STANDARDS:
+- Think and compose like a top-tier broadcast & editorial graphic designer: strict visual grid, intentional negative space, balanced focal hierarchy, refined lighting, and cohesive restraint.
+- STRICT ANTI-CLUTTER RULE: NEVER invent or add unrequested decorative clichés (such as mandalas, floral/arabesque ornaments, random swirling patterns, floating dust/sparkle particles, cheesy lens flares, chaotic neon lines, or arbitrary filler shapes) — and do NOT write negative mentions of those banned items in the output prompt itself; simply focus purely on clean surfaces, intentional negative space, and elements that directly serve the user's topic and data.
+- Write pure, polished, visual description prose inside each output prompt. NEVER include meta-instructions like "CRITICAL REQUIREMENT" or "You MUST" inside the generated prompt string itself.`;
+
+function buildAvaStyleGuidance(useAvaStyle?: boolean): string {
+  if (!useAvaStyle) return '';
+  return `
+AVA SIGNATURE BROADCAST STYLE:
+- Color Palette: Rich deep violet-indigo and dark slate base accented cleanly with refined electric blue and vibrant magenta highlights.
+- Aesthetic: High-end modern TV broadcast & executive newsroom motion-design aesthetic—crisp glassmorphic cards, clean architectural light beams, subtle linear depth, disciplined geometric framing, and polished studio lighting.
+- Restraint: Keep surfaces sleek, architectural, and uncluttered without ornamental patterns, busy network webs, or decorative particles.`;
+}
+
+function buildTypographyHierarchy(
+  textFont?: string,
+  numberFont?: string,
+  englishFont?: string
+): string {
+  const primary = textFont || 'IBM Plex Sans Arabic';
+  const extras = [
+    numberFont ? `Number Font: "${numberFont}"` : '',
+    englishFont ? `English Font: "${englishFont}"` : '',
+  ]
+    .filter(Boolean)
+    .join(', ');
+
+  if (primary === 'IBM Plex Sans Arabic') {
+    return `Act as a senior graphic designer assigning typographic weight hierarchy automatically using the "IBM Plex Sans Arabic" font family: use IBM Plex Sans Arabic Bold (700) for main headlines and hero titles, IBM Plex Sans Arabic SemiBold (600) or Medium (500) for subheadings and section headers, IBM Plex Sans Arabic Regular (400) for body text and data descriptions, and IBM Plex Sans Arabic Light (300), ExtraLight (200), or Thin (100) for slogans, taglines, captions, and subtle metadata.${extras ? ` Also apply ${extras}.` : ''}`;
+  }
+
+  return `Act as a senior graphic designer applying clean typographic weight hierarchy with "${primary}" (Bold for main headlines, SemiBold/Medium for subheadings, Regular for body text, Light/Thin for slogans and captions).${extras ? ` Also apply ${extras}.` : ''}`;
+}
+
+function stripMarkdownFences(raw: string): string {
+  let text = raw.trim();
+  const fenced = text.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+  if (fenced) {
+    text = fenced[1].trim();
+  }
+  return text;
+}
+
+function parseJsonSafe(raw: string): unknown {
+  const cleaned = stripMarkdownFences(raw);
+  try {
+    return JSON.parse(cleaned);
+  } catch {
+    // Attempt extracting JSON array or object if surrounded by extra text
+    const firstBracket = cleaned.indexOf('[');
+    const lastBracket = cleaned.lastIndexOf(']');
+    if (firstBracket !== -1 && lastBracket > firstBracket) {
+      return JSON.parse(cleaned.slice(firstBracket, lastBracket + 1));
+    }
+    throw new Error('Invalid JSON response from model');
+  }
+}
+
+function resolveThinkingConfig(level?: ThinkingPreset) {
+  const map: Record<ThinkingPreset, ThinkingLevel> = {
+    LOW: ThinkingLevel.LOW,
+    MEDIUM: ThinkingLevel.MEDIUM,
+    HIGH: ThinkingLevel.HIGH,
+  };
+  return { thinkingLevel: map[level || 'LOW'] };
+}
+
+function buildInlineParts(images?: string[]): InlineImagePart[] {
+  if (!images || images.length === 0) return [];
+  return images.map(dataUrlToInlinePart).filter((p): p is InlineImagePart => p !== null);
+}
+
+// ==========================================
+// EXPORTED TYPES & GENERATORS
+// ==========================================
+
+export interface PromptResult {
+  title: string;
+  prompt: string;
+  prompts?: string[];
+  isError?: boolean;
+}
+
+export interface GenerateOptions {
+  model?: string;
+  thinkingLevel?: ThinkingPreset;
+  signal?: AbortSignal;
+  onProgress?: (completed: number, total: number, label: string) => void;
+}
 
 export interface PromptRequest {
   data: string[];
@@ -82,49 +335,29 @@ export interface PromptRequest {
   numberFont: string;
   englishFont: string;
   aspectRatio: string;
-  styleImages: string[]; // base64 strings
+  styleImages: string[];
   selectedStyles?: string[];
   mode: 'infographic' | 'map';
   useAvaStyle?: boolean;
-  styleType?: 'graphic' | 'realistic' | 'graphic_realistic' | 'original';
+  styleType?: StyleType;
   color1?: string;
   color2?: string;
   bgColor?: string;
-  bgPresetImage?: string | null;
-  bgPresetName?: string | null;
 }
 
-export interface PromptResult {
-  title: string;
-  prompt: string;
-  prompts?: string[];
-  seed?: number;
-}
-
-export async function generateInfographicPrompts(request: PromptRequest, customModel?: string): Promise<PromptResult[]> {
-  const model = customModel || "gemini-3-flash-preview";
-  
-  const presetStyleMap: Record<string, { title: string; desc: string }> = {
-    'cyber-map': { title: 'Cyber Map', desc: 'Futuristic tactical UI with glowing lines, data points, and a dark blue/cyan aesthetic.' },
-    'futuristic-3d': { title: 'Futuristic 3D', desc: 'Dark 3D presentation style with glowing spheres, deep purple gradients, and high-tech depth.' },
-    'tech-landing': { title: 'Tech Landing', desc: 'Modern tech landing page style with glowing blue cards, clean white text, and a professional dark theme.' },
-    'ai-analytics': { title: 'AI Analytics', desc: 'Isometric data visualization style with 3D bar charts, world maps, and AI-themed purple/blue accents.' },
-    'ai-ecosystem': { title: 'AI Ecosystem', desc: 'Central node network style connecting various AI service logos with glowing lines and a dark, immersive background.' },
-    'minimalist': { title: 'Minimalist', desc: 'A clean, minimalist corporate style with a white background and professional blue accents.' },
-    'vibrant': { title: 'Vibrant Modern', desc: 'A vibrant, high-energy modern style with bold gradients and dark mode aesthetic.' },
-    'editorial': { title: 'Editorial', desc: 'A sophisticated editorial style with serif typography and warm earth tones.' },
-    'tech-grid': { title: 'Tech Grid', desc: 'A futuristic tech-focused style with neon highlights and data-grid patterns.' },
-    'purple-special': { title: 'Purple Special', desc: 'A professional, easy-to-understand infographic with a slightly dark purple background. The typography and visual elements must strictly use a color palette of white, purple, pink, and blue.' }
-  };
-
+export async function generateInfographicPrompts(
+  request: PromptRequest,
+  options: GenerateOptions = {}
+): Promise<PromptResult[]> {
+  const model = options.model || DEFAULT_MODEL;
   const stylesToGenerate: { title: string; description: string; image?: string }[] = [];
 
   if (request.selectedStyles && request.selectedStyles.length > 0) {
-    request.selectedStyles.forEach(styleId => {
-      if (presetStyleMap[styleId]) {
-        stylesToGenerate.push({ 
-          title: presetStyleMap[styleId].title, 
-          description: presetStyleMap[styleId].desc 
+    request.selectedStyles.forEach((styleId) => {
+      if (PRESET_STYLE_MAP[styleId]) {
+        stylesToGenerate.push({
+          title: PRESET_STYLE_MAP[styleId].title,
+          description: PRESET_STYLE_MAP[styleId].desc,
         });
       }
     });
@@ -132,215 +365,182 @@ export async function generateInfographicPrompts(request: PromptRequest, customM
 
   if (request.styleImages && request.styleImages.length > 0) {
     request.styleImages.forEach((img, idx) => {
-      stylesToGenerate.push({ 
+      stylesToGenerate.push({
         title: `Custom Style ${idx + 1}`,
-        description: "Use the provided reference image ONLY for its COLOR PALETTE and LIGHTING. Do NOT use its background or layout.",
-        image: img
+        description:
+          'Extract ONLY the color palette, atmosphere, and lighting mood from the provided reference image; do NOT copy its layout or unrelated objects.',
+        image: img,
       });
     });
   }
 
   if (stylesToGenerate.length === 0) {
-    stylesToGenerate.push({ 
-      title: request.bgPresetName ? `Preset ${request.bgPresetName.toUpperCase()}` : 'General Style', 
-      description: 'A professional and clean data visualization style that focuses on clarity and modern aesthetics.' 
-    });
-  } else if (request.bgPresetName) {
-    stylesToGenerate.forEach(style => {
-      style.title = `${style.title} + ${request.bgPresetName.toUpperCase()}`;
+    stylesToGenerate.push({
+      title: 'General Style',
+      description: 'A clean, modern, high-clarity visual layout focused on data readability.',
     });
   }
 
-  let baseStyleInstruction = "";
-  if (request.styleType && request.styleType !== 'original') {
-    if (request.styleType === 'realistic') {
-      baseStyleInstruction = "CRITICAL STYLE REQUIREMENT: The overall visual style MUST be 100% photorealistic, cinematic, and highly detailed. It must look like a real-world photograph taken with a high-end camera. ABSOLUTELY NO 2D graphics, NO flat illustrations, and NO cartoonish elements. ";
-    } else if (request.styleType === 'graphic') {
-      baseStyleInstruction = `CRITICAL STYLE REQUIREMENT: The overall visual style MUST be a pure 2D/3D graphic illustration, modern, and clean. ABSOLUTELY NO photorealism, NO real-world photography, and NO photographic elements. The main background color MUST be ${request.bgColor}. You MUST STRICTLY restrict the color palette of all graphic elements, charts, and icons to ${request.color1} and ${request.color2}. DO NOT introduce any other colors. `;
-    } else {
-      baseStyleInstruction = `CRITICAL STYLE REQUIREMENT: The overall visual style MUST be a seamless blend of photorealism AND modern graphic design. It MUST combine real-world photographic elements with graphic overlays. The main background color MUST be ${request.bgColor}. Enhance the realistic elements with delicate, neat graphic elements (e.g., charts, glowing lights, rounded shapes, particles). You MUST STRICTLY restrict the color palette of these graphic elements to ${request.color1} and ${request.color2}. DO NOT introduce any other colors for the graphics. `;
-    }
-  }
+  const { instruction: visualGuidance, enforceColors } = buildVisualStyleGuidance(
+    request.styleType,
+    request.color1,
+    request.color2,
+    request.bgColor
+  );
+  const avaGuidance = buildAvaStyleGuidance(request.useAvaStyle);
 
-  const results: PromptResult[] = [];
+  const modeInstruction =
+    request.mode === 'map'
+      ? `The image MUST be a highly accurate, realistic geographic map visualization. Ensure borders and terrain are precise.
+         If specific locations (e.g., Erbil, Qatar, cities, countries) are mentioned, place callouts, labels, and pins on their accurate geographic positions.
+         If country names are mentioned, include accurate national flags beside their labels.`
+      : `The image MUST be a professional, data-driven infographic layout (charts, icons, cards, structured timelines) clearly representing all provided data.
+         Convert percentages into clear visual charts (bar, pie, or progress rings) and sequences into clean timelines.
+         LAYOUT DIRECTION: Organize the visual flow Right-to-Left (RTL) suitable for Kurdish/Arabic reading order, while keeping the overall composition centered and balanced.`;
 
-  for (const styleConfig of stylesToGenerate) {
-    let imagePart: any = null;
-    let bgPresetPart: any = null;
-    const styleDescription = styleConfig.description;
+  const colorRule = enforceColors
+    ? `Strict Color Palette: Background ${request.bgColor}; graphic elements restricted to ${request.color1} and ${request.color2}.`
+    : 'Color Palette: Cohesive, well-balanced colors matching the chosen visual style.';
 
+  const formattedData = request.data
+    .map((d, i) => `--- SLIDE ${i + 1} DATA ---\n${d}\n`)
+    .join('\n');
+
+  const totalStyles = stylesToGenerate.length;
+  checkAborted(options.signal);
+  options.onProgress?.(
+    0,
+    1,
+    totalStyles === 1 ? stylesToGenerate[0].title : `${totalStyles} styles (1 request)`
+  );
+
+  const parts: any[] = [];
+  stylesToGenerate.forEach((styleConfig) => {
     if (styleConfig.image) {
-      imagePart = {
-        inlineData: {
-          mimeType: "image/png",
-          data: styleConfig.image.split(",")[1],
-        },
-      };
-    }
-
-    if (request.bgPresetImage) {
-      bgPresetPart = {
-        inlineData: {
-          mimeType: "image/png",
-          data: request.bgPresetImage.split(",")[1],
-        },
-      };
-    }
-
-    const modeInstruction = request.mode === 'map' 
-      ? `The image MUST be a highly accurate, realistic geographic map visualization (similar to Google Maps style). Ensure all borders and locations are precise. 
-         CRITICAL: If specific locations (e.g., Qatar, Erbil, etc.) are mentioned, place the callouts, labels, and icons EXACTLY on their correct geographic coordinates on the map. Do not place them randomly. 
-         If country names are mentioned, include their correct national flags next to the names without any errors.`
-      : `The image MUST be a professional, data-driven infographic layout (charts, icons, lists) that clearly represents the provided data. If percentages are present, convert them into clear visual charts (pie charts, bar charts, or progress rings). If dates or sequences are present, implement a clear vertical or horizontal timeline. The focus is on clarity and professional data visualization.
-         CRITICAL: The visual flow and data organization MUST be from Right-to-Left (RTL), following the reading direction of Arabic/Kurdish. Elements should be ordered starting from the right side of the canvas.
-         COMPOSITION: The main data elements and graphics MUST be centered in the composition for a balanced look.`;
-
-    const avaStyleInstruction = request.useAvaStyle 
-      ? `\n\nCRITICAL AVA STYLE OVERRIDE: The entire design MUST strictly follow "AVA's Style". This means:
-         - Color Palette: Deep purples, neon blues, vibrant magentas, and glowing pinks on a dark background.
-         - Visual Elements: Incorporate high-tech digital overlays, glowing neon lines, light streaks, network nodes, data grids, and subtle mandala or abstract geometric patterns in the background.
-         - Lighting: Cinematic, luminous, with lens flares and glowing gradients.
-         - Aesthetic: A premium, modern broadcast/news graphic style that blends real-world elements with futuristic 3D digital graphics.`
-      : "";
-
-    const isBPreset = request.bgPresetName?.toLowerCase().startsWith('b');
-
-    const formattedData = request.data.map((d, i) => `--- SLIDE ${i + 1} DATA ---\n${d}\n`).join('\n');
-
-    const textPart = {
-      text: isBPreset ? 
-      `Act as a world-class AI image prompt engineer.
-      
-      CRITICAL INSTRUCTION: I have provided a BACKGROUND PRESET image (${request.bgPresetName?.toUpperCase()}). Your prompt MUST explicitly instruct the image generator to use this image EXACTLY as the background. 
-      If there are people or characters in the provided reference images, they MUST be placed on this ${request.bgPresetName?.toUpperCase()} background EXACTLY as they appear (100% identical faces, features, and poses, with NO distortion). 
-      The blending MUST be flawless, hyper-realistic, and highly accurate. Adjust the lighting, shadows, reflections, and color balance of the characters so they look like they naturally belong in the ${request.bgPresetName?.toUpperCase()} background preset. Ensure perfect perspective and scale.
-      Do NOT add any other complex elements, infographics, charts, or extra graphics. Keep the focus EXCLUSIVELY on the ${request.bgPresetName?.toUpperCase()} background and the characters.
-      
-      Aspect ratio is "${request.aspectRatio}".
-      
-      Generate ONLY the final prompt text in English. No meta-talk.`
-      : `Act as a world-class AI image prompt engineer for high-end models like Gemini 3.1 Flash Image and Midjourney v6. 
-      I will provide you with data to be visualized.
-      
-      Your task is to create a MASTERPIECE-LEVEL visual description that results in a 100% accurate, professional, and error-free infographic or map.
-      
-      ${request.bgPresetImage ? "CRITICAL INSTRUCTION: I have provided a BACKGROUND PRESET image. Your prompt MUST explicitly instruct the image generator to use this image EXACTLY as the background. If there are people or characters in the other provided reference images, they MUST be placed on this background EXACTLY as they appear (100% identical faces, features, and poses, with NO distortion). The blending MUST be flawless, hyper-realistic, and highly accurate. Adjust the lighting, shadows, reflections, and color balance of the characters so they look like they naturally belong in the background preset. Ensure perfect perspective and scale. Do not add any other complex elements; keep the focus on the background and the characters." : ""}
-      
-      CRITICAL REQUIREMENTS FOR GEMINI 3.1 FLASH IMAGE:
-      1. PROMPT STYLE: Use descriptive, immersive natural language. Start with: "A stunning, high-definition professional infographic..." or "A precise, photorealistic geographic map visualization...".
-      2. DATA LAYOUT: Use the provided data to determine the exact layout, hierarchy, and number of elements. Explicitly include the text, numbers, and labels from the data in your prompt description.
-      3. LOGICAL LAYOUT (RTL & CENTERED): Organize elements in a logical, balanced flow starting from the RIGHT side and moving to the LEFT (Right-to-Left direction). The overall composition MUST be centered and balanced on the canvas. Use "symmetrical composition," "golden ratio alignment," and "clear visual hierarchy."
-      4. ICONS & GRAPHICS: Specify "high-end vector graphics," "photorealistic 3D icons," and "clean UI elements" to represent the data points visually.
-      5. FONTS & TYPOGRAPHY STYLE: Specify the typography style using the requested fonts: Text Font: ${request.textFont}, Number Font: ${request.numberFont}, English Font: ${request.englishFont}.
-      6. DIMENSIONS: Aspect ratio is "${request.aspectRatio}".
-      7. STYLE: ${baseStyleInstruction}${styleDescription}
-      CRITICAL: You MUST also append the exact phrase "Style: ${baseStyleInstruction}${styleDescription}" to the very end of your prompt word-for-word to guarantee consistency.
-      8. MODE: ${modeInstruction}${avaStyleInstruction}
-      9. ACCURACY: "The layout must be 100% accurate to the structure of the provided data. Every element must correspond to a specific data point."
-      10. AESTHETIC: Aim for a "Midjourney-level aesthetic" with "cinematic lighting," "premium textures," "professional color grading," and "ultra-realistic rendering."
-      11. COLOR PALETTE: You MUST strictly adhere to the requested colors. The background must be exactly the requested background color, and the graphic elements must only use the requested accent colors. Do NOT hallucinate or add random colors.
-      12. EXTREME DETAIL: Provide an EXTREMELY detailed description of every visual element, texture, and lighting effect to ensure the highest possible quality.
-      
-      CRITICAL INSTRUCTION FOR MULTIPLE SLIDES:
-      The user has provided data for ${request.data.length} distinct slide(s).
-      You MUST generate a separate, highly detailed image generation prompt for EACH slide based on its specific data.
-      CRITICAL: All slides MUST share the EXACT SAME visual style, color palette, lighting, camera angles, and aesthetic. To achieve this, the style-related keywords and descriptions MUST BE IDENTICAL across all slide prompts. ONLY change the specific subject/content (text, data points, central icon) of the slide. Do not introduce new colors or stylistic elements in different slides.
-      
-      Data to visualize (${request.data.length} SLIDES):
-      ${formattedData}
-      
-      Generate the output as a JSON array containing EXACTLY 1 object, where the object has a "title" (e.g., "${styleConfig.title}") and a "prompts" array containing exactly ${request.data.length} strings (one highly detailed image generation prompt for each slide in English).
-      
-      Generate ONLY the JSON array. No markdown formatting, no meta-talk.`,
-    };
-
-    try {
-      const contents: any = { parts: [textPart] };
-      if (imagePart) contents.parts.unshift(imagePart);
-      if (bgPresetPart) contents.parts.unshift(bgPresetPart);
-
-      const response: GenerateContentResponse = await withRetry(() => {
-        const aiInstance = new GoogleGenAI({ apiKey: getCurrentKey() });
-        return aiInstance.models.generateContent({
-          model: model,
-          contents: contents,
-          config: {
-            thinkingConfig: { thinkingLevel: ThinkingLevel.LOW }
-          }
+      const imgPart = dataUrlToInlinePart(styleConfig.image);
+      if (imgPart) {
+        parts.push({
+          text: `[REFERENCE IMAGE FOR "${styleConfig.title}": Extract ONLY color palette, lighting, and visual atmosphere for the style "${styleConfig.title}". Do NOT blend this image into other preset styles.]`,
         });
-      });
-
-      if (!response.text) {
-        results.push({
-          title: styleConfig.title,
-          prompt: "The AI refused to generate a prompt for this content. It might be due to safety filters or complex data. Please try simplifying your input.",
-          prompts: ["The AI refused to generate a prompt for this content. It might be due to safety filters or complex data. Please try simplifying your input."],
-          seed: Math.floor(Math.random() * 1000000)
-        });
-      } else {
-        let text = response.text.trim();
-        if (text.startsWith('```json')) text = text.replace(/^```json\n/, '').replace(/\n```$/, '');
-        else if (text.startsWith('```')) text = text.replace(/^```\n/, '').replace(/\n```$/, '');
-        
-        try {
-          const parsed = JSON.parse(text);
-          let finalPrompt = "";
-          let promptsArray: string[] = [];
-          const exactStyle = `Style: ${baseStyleInstruction}${styleDescription}`;
-          
-          if (Array.isArray(parsed) && parsed.length > 0 && parsed[0].prompts && Array.isArray(parsed[0].prompts)) {
-            promptsArray = parsed[0].prompts.map((p: string, i: number) => {
-              let slidePrompt = p.trim();
-              if (!slidePrompt.includes(exactStyle)) slidePrompt += `\n\n${exactStyle}`;
-              return slidePrompt;
-            });
-            finalPrompt = promptsArray.map((p, i) => `[ SLIDE ${i + 1} ]\n${p}`).join('\n\n');
-          } else {
-            finalPrompt = text;
-            if (!finalPrompt.includes(exactStyle)) finalPrompt += `\n\n${exactStyle}`;
-            promptsArray = [finalPrompt];
-          }
-          
-          results.push({
-            title: styleConfig.title,
-            prompt: finalPrompt,
-            prompts: promptsArray,
-            seed: Math.floor(Math.random() * 1000000)
-          });
-        } catch (e) {
-          console.error("Failed to parse JSON in infographic prompts", e);
-          let finalPrompt = text;
-          const exactStyle = `Style: ${baseStyleInstruction}${styleDescription}`;
-          if (!finalPrompt.includes(exactStyle)) finalPrompt += `\n\n${exactStyle}`;
-          results.push({
-            title: styleConfig.title,
-            prompt: finalPrompt,
-            prompts: [finalPrompt],
-            seed: Math.floor(Math.random() * 1000000)
-          });
-        }
+        parts.push(imgPart);
       }
-    } catch (error: any) {
-      console.error(`Error generating prompt for style ${styleConfig.title}:`, error);
-      results.push({
-        title: styleConfig.title,
-        prompt: `API Error: ${error.message}`,
-        prompts: [`API Error: ${error.message}`],
-        seed: Math.floor(Math.random() * 1000000)
-      });
     }
-    
-    // پشوودان بۆ ماوەی ٢.٥ چرکە لە نێوان ناردنی ستایلەکان بۆ ئەوەی بلۆک نەبێت
-    await new Promise(resolve => setTimeout(resolve, 2500));
+  });
+
+  const stylesRosterText = stylesToGenerate
+    .map(
+      (s, i) =>
+        `${i + 1}. Title: "${s.title}"\n   Style Direction: ${visualGuidance ? `${visualGuidance} ` : ''}${s.description}`
+    )
+    .join('\n');
+
+  const exampleJson = JSON.stringify(
+    stylesToGenerate.map((s) => ({
+      title: s.title,
+      prompts: request.data.map((_, sIdx) => `prompt for slide ${sIdx + 1} in ${s.title} style`),
+    })),
+    null,
+    2
+  );
+
+  parts.push({
+    text: `Act as a world-class senior art director and AI image prompt engineer writing production-ready visual prompts for Gemini Image and Midjourney v6.
+
+${DESIGNER_RESTRAINT_RULE}
+
+TASK:
+In THIS SINGLE RESPONSE, generate prompts for ALL ${totalStyles} requested visual style(s) listed below, each covering all ${request.data.length} slide(s).
+
+REQUESTED STYLES (${totalStyles} distinct style groups):
+${stylesRosterText}
+
+SHARED SPECIFICATIONS FOR EVERY STYLE GROUP:
+1. Opening & Tone: Start naturally (e.g., "A clean, executive editorial infographic..." or "A precise, studio-grade geographic map visualization...") with balanced lighting, intentional negative space, and crisp rendering.
+2. Exact Data Fidelity: Explicitly incorporate the exact text, Kurdish/Arabic/English labels, numbers, and statistics from each slide.
+3. Composition & RTL Flow: Structured grid with clean alignment and Right-to-Left visual hierarchy where applicable, leaving generous breathing room around cards and text.
+4. Typography Style: ${buildTypographyHierarchy(request.textFont, request.numberFont, request.englishFont)}
+5. Aspect Ratio: Frame for "${request.aspectRatio}".
+6. Mode Rules: ${modeInstruction}
+7. ${colorRule}${avaGuidance}
+8. Multi-Slide Consistency WITHIN Each Style: Within any single style group, all ${request.data.length} slide prompts MUST share that style's identical visual language, grid discipline, lighting, and color palette, changing only the specific slide content and relevant subject icons.
+9. Distinctness ACROSS Styles: Each of the ${totalStyles} style groups MUST faithfully reflect its own distinct aesthetic and title without blending unrelated presets together.
+
+Data (${request.data.length} slide(s)):
+${formattedData}
+
+Return ONLY a valid JSON array of EXACTLY ${totalStyles} object(s) in the exact same order:
+${exampleJson}`,
+  });
+
+  const response: GenerateContentResponse = await withRetry(
+    (apiKey) => {
+      const ai = new GoogleGenAI({ apiKey });
+      return ai.models.generateContent({
+        model,
+        contents: { parts },
+        config: {
+          responseMimeType: 'application/json',
+          thinkingConfig: resolveThinkingConfig(options.thinkingLevel),
+        },
+      });
+    },
+    options.signal
+  );
+
+  options.onProgress?.(1, 1, totalStyles === 1 ? stylesToGenerate[0].title : `${totalStyles} styles`);
+
+  if (!response.text) {
+    throw new Error('The AI returned an empty response (possibly due to safety filters). Try simplifying your input.');
   }
 
-  return results;
+  try {
+    const parsed = parseJsonSafe(response.text);
+    if (Array.isArray(parsed) && parsed.length > 0) {
+      const results: PromptResult[] = parsed.map((group: any, idx: number) => {
+        const fallbackTitle = stylesToGenerate[idx]?.title || `Style ${idx + 1}`;
+        const title = String(group?.title || fallbackTitle);
+
+        let promptsArray: string[] = [];
+        if (Array.isArray(group?.prompts) && group.prompts.length > 0) {
+          promptsArray = group.prompts.map((item: unknown) =>
+            typeof item === 'string' ? item.trim() : JSON.stringify(item)
+          );
+        } else if (group?.prompt) {
+          promptsArray = [String(group.prompt).trim()];
+        } else {
+          promptsArray = [stripMarkdownFences(JSON.stringify(group))];
+        }
+
+        const combined = promptsArray
+          .map((p, sIdx) => (promptsArray.length > 1 ? `[ SLIDE ${sIdx + 1} ]\n${p}` : p))
+          .join('\n\n');
+
+        return {
+          title,
+          prompt: combined,
+          prompts: promptsArray,
+        };
+      });
+      return results;
+    }
+  } catch {
+    // Fallback if non-array returned
+  }
+
+  const fallbackText = stripMarkdownFences(response.text);
+  return [
+    {
+      title: stylesToGenerate.map((s) => s.title).join(' + '),
+      prompt: fallbackText,
+      prompts: [fallbackText],
+    },
+  ];
 }
 
 export interface ImageToPromptRequest {
   image: string;
   selectedStyles?: string[];
-  styleType?: 'graphic' | 'realistic' | 'graphic_realistic' | 'original';
+  styleType?: StyleType;
   color1?: string;
   color2?: string;
   bgColor?: string;
@@ -350,111 +550,100 @@ export interface ImageToPromptRequest {
   textFont?: string;
   numberFont?: string;
   englishFont?: string;
+  useAvaStyle?: boolean;
 }
 
-export async function generateImageToPromptPrompts(request: ImageToPromptRequest, customModel?: string): Promise<PromptResult[]> {
-  const model = customModel || "gemini-3-flash-preview";
-
-  const presetStyleMap: Record<string, { title: string; desc: string }> = {
-    'cyber-map': { title: 'Cyber Map', desc: 'Futuristic tactical UI with glowing lines, data points, and a dark blue/cyan aesthetic.' },
-    'futuristic-3d': { title: 'Futuristic 3D', desc: 'Dark 3D presentation style with glowing spheres, deep purple gradients, and high-tech depth.' },
-    'tech-landing': { title: 'Tech Landing', desc: 'Modern tech landing page style with glowing blue cards, clean white text, and a professional dark theme.' },
-    'ai-analytics': { title: 'AI Analytics', desc: 'Isometric data visualization style with 3D bar charts, world maps, and AI-themed purple/blue accents.' },
-    'ai-ecosystem': { title: 'AI Ecosystem', desc: 'Central node network style connecting various AI service logos with glowing lines and a dark, immersive background.' },
-    'minimalist': { title: 'Minimalist', desc: 'A clean, minimalist corporate style with a white background and professional blue accents.' },
-    'vibrant': { title: 'Vibrant Modern', desc: 'A vibrant, high-energy modern style with bold gradients and dark mode aesthetic.' },
-    'editorial': { title: 'Editorial', desc: 'A sophisticated editorial style with serif typography and warm earth tones.' },
-    'tech-grid': { title: 'Tech Grid', desc: 'A futuristic tech-grid style with neon highlights and data-grid patterns.' },
-    'purple-special': { title: 'Purple Special', desc: 'A professional, easy-to-understand infographic with a slightly dark purple background. The typography and visual elements must strictly use a color palette of white, purple, pink, and blue.' }
-  };
-
-  let styleInstruction = "";
-  let exactStyleKeywords = "";
-  if (request.selectedStyles && request.selectedStyles.length > 0) {
-    const styles = request.selectedStyles.map(s => presetStyleMap[s]?.desc).filter(Boolean).join(" AND ");
-    exactStyleKeywords += styles;
-    styleInstruction = `\n\nCRITICAL STYLE OVERRIDE: While describing the image, you MUST adapt the description so that the final prompt will generate an image in the following style(s): ${styles}.`;
+export async function generateImageToPromptPrompts(
+  request: ImageToPromptRequest,
+  options: GenerateOptions = {}
+): Promise<PromptResult[]> {
+  const model = options.model || DEFAULT_MODEL;
+  const mainImagePart = dataUrlToInlinePart(request.image);
+  if (!mainImagePart) {
+    throw new Error('Could not parse the uploaded image format.');
   }
 
-  if (request.styleType && request.styleType !== 'original') {
-    if (request.styleType === 'realistic') {
-      const s = "CRITICAL STYLE REQUIREMENT: The overall visual style MUST be described as 100% photorealistic, cinematic, and highly detailed. It must look like a real-world photograph taken with a high-end camera. ABSOLUTELY NO 2D graphics, NO flat illustrations, and NO cartoonish elements.";
-      styleInstruction += ` ${s}`;
-      exactStyleKeywords += ` ${s}`;
-    } else if (request.styleType === 'graphic') {
-      const s = `CRITICAL STYLE REQUIREMENT: The overall visual style MUST be described as a pure 2D/3D graphic illustration, modern, and clean. ABSOLUTELY NO photorealism, NO real-world photography, and NO photographic elements. The main background color MUST be ${request.bgColor}. You MUST STRICTLY restrict the color palette of all graphic elements to ${request.color1} and ${request.color2}. DO NOT introduce any other colors.`;
-      styleInstruction += ` ${s}`;
-      exactStyleKeywords += ` ${s}`;
-    } else {
-      const s = `CRITICAL STYLE REQUIREMENT: The overall visual style MUST be described as a seamless blend of photorealism AND modern graphic design. It MUST combine real-world photographic elements with graphic overlays. The main background color MUST be ${request.bgColor}. Enhance the realistic elements with delicate, neat graphic elements. You MUST STRICTLY restrict the color palette of these graphic elements to ${request.color1} and ${request.color2}. DO NOT introduce any other colors for the graphics.`;
-      styleInstruction += ` ${s}`;
-      exactStyleKeywords += ` ${s}`;
+  let styleGuidance = '';
+  if (request.selectedStyles && request.selectedStyles.length > 0) {
+    const styleDescriptions = request.selectedStyles
+      .map((s) => PRESET_STYLE_MAP[s]?.desc)
+      .filter(Boolean)
+      .join(' ');
+    if (styleDescriptions) {
+      styleGuidance += `\nTarget Style Adaptation: Adapt the visual description into this aesthetic: ${styleDescriptions}`;
     }
   }
 
-  let imageParts: any[] = [];
-  if (request.styleImages && request.styleImages.length > 0) {
-    styleInstruction += " I have also provided additional reference images. You MUST incorporate their visual style, color palette, and lighting into your final prompt description.";
-    request.styleImages.forEach((img) => {
-      imageParts.push({ inlineData: { mimeType: "image/png", data: img.split(",")[1] } });
-    });
+  const { instruction: visualGuidance, enforceColors } = buildVisualStyleGuidance(
+    request.styleType,
+    request.color1,
+    request.color2,
+    request.bgColor
+  );
+  if (visualGuidance) {
+    styleGuidance += `\n${visualGuidance}`;
   }
+
+  const extraImageParts = buildInlineParts(request.styleImages);
+  if (extraImageParts.length > 0) {
+    styleGuidance +=
+      '\nReference Style Images: Incorporate the color palette, atmosphere, and lighting from the additional reference images.';
+  }
+
+  const avaGuidance = buildAvaStyleGuidance(request.useAvaStyle);
 
   const textPart = {
-    text: `Act as a world-class AI image prompt engineer. I have provided a main image. 
-    Your task is to analyze this main image in EXTREME detail and write a highly descriptive, professional prompt (in English) that could be used in an AI image generator (like Midjourney v6 or Gemini 3.1 Flash Image) to recreate this image with 100% accuracy.${styleInstruction}
-    
-    Describe the subjects, composition, lighting, colors, mood, textures, and any specific details or text visible with EXTREME PRECISION.
-    Make it a single, cohesive, highly detailed prompt paragraph.
-    
-    ${request.aspectRatio ? `CRITICAL: Aspect ratio is "${request.aspectRatio}".` : ''}
-    ${request.textFont ? `FONTS & TYPOGRAPHY STYLE: Specify the typography style using the requested fonts: Text Font: ${request.textFont}, Number Font: ${request.numberFont}, English Font: ${request.englishFont}.` : ''}
-    ${request.bgColor ? `CRITICAL COLOR PALETTE: You MUST strictly adhere to the requested colors. The background must be exactly ${request.bgColor}, and the graphic elements must only use ${request.color1} and ${request.color2}. Do NOT hallucinate or add random colors.` : ''}
-    
-    ${request.customInstructions ? `CRITICAL USER INSTRUCTIONS / MODIFICATIONS:\nThe user has provided the following specific instructions or modifications to apply to the generated prompt. You MUST incorporate these changes into the final prompt description with EXTREME DETAIL:\n"${request.customInstructions}"\n` : ''}
-    
-    Generate the output as a JSON array containing EXACTLY 1 object, where the object has a "title" (e.g., "Extracted Prompt") and a "prompt" (the highly detailed image generation prompt in English).
-    
-    Generate ONLY the JSON array. No markdown formatting, no meta-talk.`
+    text: `Act as a world-class senior art director and AI image prompt engineer. Analyze the primary image with extreme precision and craft a cohesive, production-ready English prompt suitable for Gemini Image or Midjourney v6.
+
+${DESIGNER_RESTRAINT_RULE}
+
+Describe ONLY what is genuinely present in the reference image (subjects, composition, camera lens/angle, lighting, materials, typography, color harmony) plus any explicit style adaptations below.${styleGuidance}${avaGuidance}
+${request.aspectRatio ? `Aspect Ratio: "${request.aspectRatio}".` : ''}
+${request.textFont ? `Typography Reference (if text appears): ${buildTypographyHierarchy(request.textFont, request.numberFont, request.englishFont)}` : ''}
+${enforceColors ? `Strict Color Palette: Background ${request.bgColor}; graphic elements restricted to ${request.color1} and ${request.color2}.` : ''}
+${request.customInstructions ? `User Requested Modifications (apply carefully): "${request.customInstructions}"` : ''}
+
+Return ONLY a valid JSON array containing EXACTLY 1 object:
+[
+  {
+    "title": "Extracted Prompt",
+    "prompt": "the detailed visual prompt in English"
+  }
+]`,
   };
 
-  const mainImagePart = {
-    inlineData: { mimeType: "image/png", data: request.image.split(",")[1] },
-  };
+  const response = await withRetry(
+    (apiKey) => {
+      const ai = new GoogleGenAI({ apiKey });
+      return ai.models.generateContent({
+        model,
+        contents: { parts: [mainImagePart, ...extraImageParts, textPart] },
+        config: {
+          responseMimeType: 'application/json',
+          thinkingConfig: resolveThinkingConfig(options.thinkingLevel),
+        },
+      });
+    },
+    options.signal
+  );
+
+  if (!response.text) {
+    throw new Error('The AI returned an empty response for this image.');
+  }
 
   try {
-    const response = await withRetry(() => {
-      const aiInstance = new GoogleGenAI({ apiKey: getCurrentKey() });
-      return aiInstance.models.generateContent({
-        model: model,
-        contents: { parts: [mainImagePart, ...imageParts, textPart] },
-        config: {
-          responseMimeType: "application/json",
-          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW }
-        }
-      });
-    });
-
-    if (!response.text) return [{ title: "Error", prompt: "Failed to generate prompt from image." }];
-
-    try {
-      const parsed = JSON.parse(response.text);
-      if (Array.isArray(parsed) && parsed.length > 0) {
-        parsed.forEach(item => {
-          if (exactStyleKeywords && !item.prompt.includes(exactStyleKeywords)) {
-            item.prompt += `\n\nStyle: ${exactStyleKeywords}`;
-          }
-        });
-      }
-      return parsed;
-    } catch (e) {
-      console.error("Failed to parse JSON", e);
-      return [{ title: "Raw Output", prompt: response.text }];
+    const parsed = parseJsonSafe(response.text);
+    if (Array.isArray(parsed) && parsed.length > 0) {
+      return parsed.map((item: any, idx: number) => ({
+        title: String(item?.title || `Extracted Prompt ${idx + 1}`),
+        prompt: String(item?.prompt || '').trim(),
+      }));
     }
-  } catch (error: any) {
-    console.error("Error generating image-to-prompt:", error);
-    return [{ title: "Error", prompt: `API Error: ${error.message}` }];
+  } catch {
+    // Fallback to raw cleaned text
   }
+
+  return [{ title: 'Extracted Prompt', prompt: stripMarkdownFences(response.text) }];
 }
 
 export interface FHDPromptRequest {
@@ -469,120 +658,112 @@ export interface FHDPromptRequest {
   safeZoneRight?: number;
   safeZoneTop?: number;
   subjectDistance?: number;
+  useAvaStyle?: boolean;
 }
 
-export async function generateFHDPrompts(request: FHDPromptRequest, customModel?: string): Promise<PromptResult[]> {
-  const model = customModel || "gemini-3-flash-preview";
+const B1_PROMPT =
+  'A high-quality, clean digital background with a professional broadcast aesthetic. The design features a smooth deep navy blue gradient, with a soft purple glow on the far left and a bright cyan light on the right. In the center, there is a very faint, minimalist world map composed of tiny dots (dotted map style). On the far right, there are vertical blue bars with diagonal stripes and a glossy finish. Smooth surface, high-tech corporate style, 8k resolution, cinematic lighting, no checkered grid or mesh.';
 
-  let imageInstruction = "";
-  let imageParts: any[] = [];
-  if (request.images && request.images.length > 0) {
-    const numImages = request.images.length;
-    const distanceText = request.subjectDistance && request.subjectDistance > 0
-      ? `place them approximately ${request.subjectDistance}% apart from each other`
-      : `place them EXTREMELY CLOSE together (e.g., standing shoulder-to-shoulder, forming a tight group)`;
-      
+export async function generateFHDPrompts(
+  request: FHDPromptRequest,
+  options: GenerateOptions = {}
+): Promise<PromptResult[]> {
+  const model = options.model || DEFAULT_MODEL;
+  const imageParts = buildInlineParts(request.images);
+
+  let imageInstruction = '';
+  if (imageParts.length > 0) {
+    const numImages = imageParts.length;
+    const distanceText =
+      request.subjectDistance && request.subjectDistance > 0
+        ? `positioned approximately ${request.subjectDistance}% apart from each other`
+        : 'standing very close together, shoulder-to-shoulder, forming a tight cohesive group';
+
     if (request.keepOriginal) {
-      imageInstruction = `I have provided ${numImages} reference image(s) of characters/people. Your prompt MUST explicitly instruct the image generator to act as a BACKGROUND REPLACEMENT tool. The persons/subjects from the reference images MUST NOT BE CHANGED, REDRAWN, OR ALTERED IN ANY WAY. Keep their exact faces, exact clothing, exact poses, exact proportions, and exact lighting 100% identical to the originals. ${distanceText.charAt(0).toUpperCase() + distanceText.slice(1)} and replace the background.`;
+      imageInstruction = `Reference Character Preservation (${numImages} image(s)): Instruct the image generator to keep the exact faces, expressions, clothing, poses, and proportions of the reference person(s) 100% unchanged, ${distanceText}, seamlessly integrated into the new scene/background.`;
     } else {
-      imageInstruction = `I have provided ${numImages} reference image(s). Your prompt MUST explicitly instruct the image generator to combine ALL ${numImages} subjects/elements into ONE SINGLE cohesive scene, ${distanceText}. Use them as inspiration for the style and subjects, but you have creative freedom to alter poses, faces, or details as needed to make them fit naturally and closely together in one image.`;
+      imageInstruction = `Reference Subjects (${numImages} image(s)): Combine all ${numImages} subjects naturally into ONE cohesive scene, ${distanceText}, adapting poses and lighting harmoniously.`;
     }
-    request.images.forEach((img) => {
-      imageParts.push({ inlineData: { mimeType: "image/png", data: img.split(",")[1] } });
-    });
   }
 
-  const B1_PROMPT = "A high-quality, clean digital background with a professional broadcast aesthetic. The design features a smooth deep navy blue gradient, with a soft purple glow on the far left and a bright cyan light on the right. In the center, there is a very faint, minimalist world map composed of tiny dots (dotted map style). On the far right, there are vertical blue bars with diagonal stripes and a glossy finish. NO grid lines, NO checkered pattern, NO mesh. Smooth surface, high-tech corporate style, 8k resolution, cinematic lighting.";
-
-  let bgInstruction = "";
+  let bgInstruction = '';
   if (request.bgPresetName === 'B1') {
-    bgInstruction = `CRITICAL INSTRUCTION: You MUST use the following exact description for the background of the image: "${B1_PROMPT}". Place the subjects/characters directly into this background, matching the lighting and perspective seamlessly.`;
+    bgInstruction = `Background Preset (B1): Use this exact broadcast background description: "${B1_PROMPT}". Integrate subjects naturally with matching perspective and lighting.`;
   } else if (request.bgPresetImage) {
-    bgInstruction = "CRITICAL INSTRUCTION: I have provided a BACKGROUND PRESET image. You MUST use this exact image as the actual background of the final generated image. Place the subjects/characters directly into this background, matching the lighting and perspective seamlessly. DO NOT use a black or plain background.";
-    imageParts.push({ inlineData: { mimeType: "image/png", data: request.bgPresetImage.split(",")[1] } });
+    const presetPart = dataUrlToInlinePart(request.bgPresetImage);
+    if (presetPart) {
+      imageParts.push(presetPart);
+      bgInstruction = `Background Preset (${request.bgPresetName?.toUpperCase() || 'Custom'}): Use the provided background preset image as the exact scene backdrop, matching subject shadows, reflections, perspective, and color grading naturally.`;
+    }
   }
 
-  let safeZoneInstruction = "";
-  if ((request.safeZoneLeft && request.safeZoneLeft > 0) || 
-      (request.safeZoneRight && request.safeZoneRight > 0) || 
-      (request.safeZoneTop && request.safeZoneTop > 0)) {
-    safeZoneInstruction = `\n\nCRITICAL INSTRUCTION: Your prompt MUST explicitly instruct the image generator to position all persons/subjects with specific padding from the edges: approximately ${request.safeZoneLeft || 0}% away from the left edge, ${request.safeZoneRight || 0}% away from the right edge, and ${request.safeZoneTop || 0}% away from the top edge. Do not place subjects near these edges.`;
+  let safeZoneInstruction = '';
+  if (
+    (request.safeZoneLeft && request.safeZoneLeft > 0) ||
+    (request.safeZoneRight && request.safeZoneRight > 0) ||
+    (request.safeZoneTop && request.safeZoneTop > 0)
+  ) {
+    safeZoneInstruction = `\nComposition Safe Zone: Keep all main subjects padded approximately ${request.safeZoneLeft || 0}% from the left edge, ${request.safeZoneRight || 0}% from the right edge, and ${request.safeZoneTop || 0}% from the top edge.`;
   }
 
-  const isBPreset = request.bgPresetName?.toLowerCase().startsWith('b');
-  const hasImages = request.images && request.images.length > 0;
+  const avaGuidance = buildAvaStyleGuidance(request.useAvaStyle);
+  const isBPreset = Boolean(request.bgPresetName?.toLowerCase().startsWith('b'));
+  const hasImages = imageParts.length > 0 && request.images.length > 0;
   const numPrompts = hasImages ? 1 : 3;
+  const titleSuffix = request.bgPresetName ? ` + ${request.bgPresetName.toUpperCase()}` : '';
 
   const textPart = {
-    text: isBPreset ?
-    `Act as a world-class AI image prompt engineer.
-    
-    User Request: "${request.prompt || 'A beautiful scene.'}"
-    
-    CRITICAL INSTRUCTION: You MUST rely COMPLETELY and STRICTLY on the information provided in the User Request. DO NOT hallucinate, invent, or add any extra elements, subjects, objects, or environments that the user did not explicitly ask for. Your prompt must be a highly detailed version of ONLY what the user requested.
-    
-    ${request.bgPresetName === 'B1' ? `You MUST explicitly instruct the image generator to use the following exact description for the background: "${B1_PROMPT}".` : `I have provided a BACKGROUND PRESET image (${request.bgPresetName?.toUpperCase()}). Your prompt MUST explicitly instruct the image generator to use this exact image as the actual background.`}
-    If there are people or characters in the provided reference images, they MUST be placed on this background EXACTLY as they appear (100% identical faces, features, and poses, with NO distortion). 
-    The blending MUST be flawless, hyper-realistic, and highly accurate. Adjust the lighting, shadows, reflections, and color balance of the characters so they look like they naturally belong in the ${request.bgPresetName?.toUpperCase()} background preset. Ensure perfect perspective and scale.
-    Do NOT add any other complex elements, text, or extra graphics.${safeZoneInstruction}
-    
-    Aspect ratio is "${request.aspectRatio}".
-    
-    Generate the output as a JSON array containing EXACTLY ${numPrompts} object(s), where each object has a "title" (e.g., "${hasImages ? 'Combined Scene' : 'Option 1'} + ${request.bgPresetName?.toUpperCase()}") and a "prompt" (the prompt in English).
-    
-    Generate ONLY the JSON array. No markdown formatting, no meta-talk.`
-    : `Act as a world-class AI image prompt engineer for high-end models like Gemini 3.1 Flash Image and Midjourney v6.
-    
-    User Request: "${request.prompt || 'A beautiful scene.'}"
-    
-    CRITICAL INSTRUCTION: You MUST rely COMPLETELY and STRICTLY on the information provided in the User Request. DO NOT hallucinate, invent, or add any extra elements, subjects, objects, or environments that the user did not explicitly ask for. Your prompt must be a highly detailed version of ONLY what the user requested.
-    
-    Your task is to create ${hasImages ? 'EXACTLY 1 MASTERPIECE-LEVEL visual description (prompt) that flawlessly combines all the provided subjects into a single cohesive scene' : '3 distinct, MASTERPIECE-LEVEL visual descriptions (prompts)'} based on the user's request.
-    
-    ${bgInstruction}${safeZoneInstruction}
-    
-    CRITICAL REQUIREMENTS:
-    1. CHARACTER CONSISTENCY: ${imageInstruction}
-    2. FLAWLESS ANATOMY: You MUST explicitly instruct the image generator to ensure perfect human anatomy, flawless symmetrical faces, realistic proportions, and no deformations or extra limbs. The subjects must look perfectly aligned, highly detailed, and professional.
-    3. EXACT DIMENSIONS: Aspect ratio is "${request.aspectRatio}". The prompt MUST instruct the generator to perfectly frame the composition to fit this exact aspect ratio without cropping important elements.
-    4. AESTHETIC: Aim for a "Midjourney-level aesthetic" with "cinematic lighting," "premium textures," "professional color grading," and "ultra-realistic rendering."
-    5. ${request.textOverlay ? `TEXT/TYPOGRAPHY: The user wants the exact text "${request.textOverlay}" written beautifully and prominently. Ensure the prompt explicitly instructs the image generator to render this exact text flawlessly.` : `NO TEXT: The final image should not contain any text, words, or letters.`}
-    6. STRICT ADHERENCE: You must incorporate EVERY SINGLE DETAIL provided by the user in their request. Do not ignore any settings, colors, or descriptions.
-    
-    Generate the output as a JSON array of objects, where each object has a "title" (a short, catchy title) and a "prompt" (the highly detailed image generation prompt in English).
-    ${request.bgPresetName ? `\n    IMPORTANT: Since the user selected the background preset "${request.bgPresetName.toUpperCase()}", you MUST include "${request.bgPresetName.toUpperCase()}" in the title of each generated prompt.` : ""}
-    
-    Example output format:
-    ${hasImages ? `[ { "title": "Combined Scene${request.bgPresetName ? ` + ${request.bgPresetName.toUpperCase()}` : ""}", "prompt": "A stunning..." } ]` : `[ { "title": "Option 1", "prompt": "A stunning..." }, { "title": "Option 2", "prompt": "A breathtaking..." } ]`}
-    
-    Generate ONLY the JSON array. No markdown formatting, no meta-talk.`,
+    text: `Act as a world-class senior art director and AI image prompt engineer writing clean, production-ready English visual prompts for Gemini Image and Midjourney v6.
+
+${DESIGNER_RESTRAINT_RULE}
+
+User Request: "${request.prompt || 'A clean, balanced visual scene.'}"
+${isBPreset ? 'Stay strictly faithful to the User Request and the selected background preset without adding unrelated extra objects or decorative motifs.' : 'Stay strictly faithful to the User Request without inventing unrelated objects, patterns, or clutter.'}
+
+Create EXACTLY ${numPrompts} prompt(s)${hasImages ? ' combining all provided subjects into a single cohesive scene' : ''}.
+${bgInstruction ? `\n${bgInstruction}` : ''}
+${imageInstruction ? `\n${imageInstruction}` : ''}${safeZoneInstruction}${avaGuidance}
+- Framing & Anatomy: Ensure realistic human anatomy, natural proportions, balanced lighting, and clean framing for aspect ratio "${request.aspectRatio}".
+- Typography: ${request.textOverlay ? `Integrate the exact text "${request.textOverlay}" cleanly and prominently into the design.` : 'Do not include any text, watermarks, or letters.'}
+
+Return ONLY a valid JSON array of EXACTLY ${numPrompts} object(s):
+[
+  { "title": "${hasImages ? `Combined Scene${titleSuffix}` : `Option 1${titleSuffix}`}", "prompt": "..." }
+]`,
   };
 
-  try {
-    const response = await withRetry(() => {
-      const aiInstance = new GoogleGenAI({ apiKey: getCurrentKey() });
-      return aiInstance.models.generateContent({
-        model: model,
+  const response = await withRetry(
+    (apiKey) => {
+      const ai = new GoogleGenAI({ apiKey });
+      return ai.models.generateContent({
+        model,
         contents: { parts: [...imageParts, textPart] },
         config: {
-          responseMimeType: "application/json",
-          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW }
-        }
+          responseMimeType: 'application/json',
+          thinkingConfig: resolveThinkingConfig(options.thinkingLevel),
+        },
       });
-    });
+    },
+    options.signal
+  );
 
-    if (!response.text) return [{ title: "Error", prompt: "Failed to generate prompts." }];
-
-    try {
-      return JSON.parse(response.text);
-    } catch (e) {
-      console.error("Failed to parse JSON", e);
-      return [{ title: "Raw Output", prompt: response.text }];
-    }
-  } catch (error: any) {
-    console.error("Error generating FHD prompts:", error);
-    return [{ title: "Error", prompt: `API Error: ${error.message}` }];
+  if (!response.text) {
+    throw new Error('The AI returned an empty response for FHD generation.');
   }
+
+  try {
+    const parsed = parseJsonSafe(response.text);
+    if (Array.isArray(parsed) && parsed.length > 0) {
+      return parsed.map((item: any, idx: number) => ({
+        title: String(item?.title || `Option ${idx + 1}${titleSuffix}`),
+        prompt: String(item?.prompt || '').trim(),
+      }));
+    }
+  } catch {
+    // Fallback
+  }
+
+  return [{ title: `Generated Prompt${titleSuffix}`, prompt: stripMarkdownFences(response.text) }];
 }
 
 export interface BackgroundPromptRequest {
@@ -598,83 +779,79 @@ export interface BackgroundPromptRequest {
   textFont?: string;
 }
 
-export async function generateBackgroundPrompts(request: BackgroundPromptRequest, customModel?: string): Promise<PromptResult[]> {
-  const model = customModel || "gemini-3-flash-preview";
+export async function generateBackgroundPrompts(
+  request: BackgroundPromptRequest,
+  options: GenerateOptions = {}
+): Promise<PromptResult[]> {
+  const model = options.model || DEFAULT_MODEL;
+  const imageParts = buildInlineParts(request.images);
 
-  let styleInstruction = "";
-  if (request.style === 'realistic') {
-    styleInstruction = "CRITICAL STYLE REQUIREMENT: The style MUST be 100% photorealistic, cinematic, and highly detailed. It must look like a real-world photograph taken with a high-end camera. ABSOLUTELY NO 2D graphics, NO flat illustrations, and NO cartoonish elements. If specific locations or landmarks are mentioned, they must be depicted exactly as they appear in reality.";
-  } else if (request.style === 'graphic') {
-    styleInstruction = `CRITICAL STYLE REQUIREMENT: The style MUST be a pure 2D/3D graphic illustration, modern, and delicate. ABSOLUTELY NO photorealism, NO real-world photography, and NO photographic elements. The main background color MUST be ${request.bgColor}. You MUST STRICTLY restrict the color palette of all graphic elements (e.g., glowing lights, rounded shapes, particles, abstract geometry) to ${request.color1} and ${request.color2}. DO NOT introduce any other colors.`;
-  } else {
-    styleInstruction = `CRITICAL STYLE REQUIREMENT: The style MUST be a seamless blend of photorealism AND modern graphic design. It MUST combine real-world photographic elements with graphic overlays. The overall background color or atmosphere MUST be ${request.bgColor}. If real locations are mentioned, depict them realistically but enhance them with delicate, neat graphic elements (e.g., glowing lights, rounded shapes, particles). You MUST STRICTLY restrict the color palette of these graphic elements to ${request.color1} and ${request.color2}. DO NOT introduce any other colors for the graphics.`;
-  }
+  const { instruction: visualGuidance, enforceColors } = buildVisualStyleGuidance(
+    request.style,
+    request.color1,
+    request.color2,
+    request.bgColor
+  );
+  const avaGuidance = buildAvaStyleGuidance(request.useAvaStyle);
 
-  let imageInstruction = "";
-  let imageParts: any[] = [];
-  if (request.images && request.images.length > 0) {
-    imageInstruction = "I have provided reference images. Your prompt MUST describe how to seamlessly blend these images together while maintaining their realistic forms and features. Provide an incredibly detailed description of the elements in these images so the image generator can recreate and blend them perfectly.";
-    request.images.forEach((img) => {
-      imageParts.push({ inlineData: { mimeType: "image/png", data: img.split(",")[1] } });
-    });
-  }
-
-  const avaStyleInstruction = request.useAvaStyle 
-    ? `\n\nCRITICAL AVA STYLE OVERRIDE: The entire design MUST strictly follow "AVA's Style". This means:
-       - Color Palette: Deep purples, neon blues, vibrant magentas, and glowing pinks on a dark background.
-       - Visual Elements: Incorporate high-tech digital overlays, glowing neon lines, light streaks, network nodes, data grids, and subtle mandala or abstract geometric patterns in the background.
-       - Lighting: Cinematic, luminous, with lens flares and glowing gradients.
-       - Aesthetic: A premium, modern broadcast/news graphic style that blends real-world elements with futuristic 3D digital graphics.`
-    : "";
+  const imageInstruction =
+    imageParts.length > 0
+      ? 'Reference Images: Seamlessly blend the key elements, environments, and realistic features of the provided reference images into a unified composition.'
+      : '';
 
   const textPart = {
-    text: `Act as a world-class AI image prompt engineer for high-end models like Gemini 3.1 Flash Image and Midjourney v6.
-    
-    User Request: "${request.request || 'Blend the provided images seamlessly.'}"
-    
-    Your task is to create 5 distinct, MASTERPIECE-LEVEL visual descriptions (prompts) based on the user's request and provided images with EXTREME DETAIL.
-    
-    CRITICAL REQUIREMENTS:
-    1. REALISM FOR LOCATIONS: If the user mentions a specific city, landmark, or location (e.g., Tehran, Erbil Citadel, Empire World), you MUST use your knowledge (or search) to describe its EXACT real-world appearance with EXTREME PRECISION. Do not invent generic buildings.
-    2. STYLE: ${styleInstruction}${avaStyleInstruction}
-    3. IMAGE BLENDING: ${imageInstruction}
-    4. DIMENSIONS: Aspect ratio is "${request.aspectRatio}".
-    5. AESTHETIC: Aim for a "Midjourney-level aesthetic" with "cinematic lighting," "premium textures," "professional color grading," and "ultra-realistic rendering."
-    6. COLOR PALETTE: You MUST strictly adhere to the requested colors (${request.bgColor}, ${request.color1}, ${request.color2}). Do NOT hallucinate or add random colors.
-    7. ${request.customText ? `TEXT/TYPOGRAPHY: The user wants the exact text "${request.customText}" written beautifully and prominently on the background. Ensure the prompt explicitly instructs the image generator to render this exact text flawlessly, integrating it into the design. The typography style should match the font "${request.textFont || 'IBM Plex Sans Arabic'}".` : `NO TEXT: The final image should not contain any text, words, or letters.`}
-    8. EXTREME DETAIL: Provide an EXTREMELY detailed description of every visual element, texture, and lighting effect to ensure the highest possible quality.
-    
-    Generate the output as a JSON array of objects, where each object has a "title" (a short, catchy title) and a "prompt" (the highly detailed image generation prompt in English).
-    
-    Generate ONLY the JSON array. No markdown formatting, no meta-talk.`,
+    text: `Act as a world-class senior art director and AI image prompt engineer writing clean, production-ready English visual prompts for Gemini Image and Midjourney v6.
+
+${DESIGNER_RESTRAINT_RULE}
+
+User Request: "${request.request || 'Blend the provided reference images into a cohesive high-end background.'}"
+
+Task: Create 5 distinct, refined, designer-grade English background prompts.
+
+Guidelines:
+1. Landmark Accuracy: If real cities or landmarks are named (e.g., Erbil Citadel, Empire World, Tehran landmarks), describe their authentic architectural features accurately without fictional fantasy additions.
+2. ${visualGuidance}${avaGuidance}
+3. ${imageInstruction || 'Environment & Composition: Refined depth, intentional clean foreground/negative space for titles or presenters, and authentic architectural or studio materials with clean uncluttered surfaces.'}
+4. Aspect Ratio: "${request.aspectRatio}".
+5. ${enforceColors ? `Color Palette: Background ${request.bgColor}; graphic elements restricted to ${request.color1} and ${request.color2}.` : 'Color Palette: Restrained, harmonious, executive color grading.'}
+6. ${request.customText ? `Typography: Feature the exact text "${request.customText}" integrated cleanly into the design. ${buildTypographyHierarchy(request.textFont)}` : 'No Text: Keep the background completely clean without words or letters.'}
+
+Return ONLY a valid JSON array of 5 objects:
+[
+  { "title": "Short Catchy Title", "prompt": "Detailed visual prompt in English" }
+]`,
   };
 
-  try {
-    const response = await withRetry(() => {
-      const aiInstance = new GoogleGenAI({ apiKey: getCurrentKey() });
-      return aiInstance.models.generateContent({
-        model: model,
+  const response = await withRetry(
+    (apiKey) => {
+      const ai = new GoogleGenAI({ apiKey });
+      return ai.models.generateContent({
+        model,
         contents: { parts: [...imageParts, textPart] },
         config: {
-          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW }
-        }
+          responseMimeType: 'application/json',
+          thinkingConfig: resolveThinkingConfig(options.thinkingLevel),
+        },
       });
-    });
+    },
+    options.signal
+  );
 
-    if (!response.text) return [{ title: "Error", prompt: "Failed to generate prompts." }];
-
-    let text = response.text.trim();
-    if (text.startsWith('```json')) text = text.replace(/^```json\n/, '').replace(/\n```$/, '');
-    else if (text.startsWith('```')) text = text.replace(/^```\n/, '').replace(/\n```$/, '');
-
-    try {
-      return JSON.parse(text);
-    } catch (e) {
-      console.error("Failed to parse JSON", e);
-      return [{ title: "Raw Output", prompt: text }];
-    }
-  } catch (error: any) {
-    console.error("Error generating background prompts:", error);
-    return [{ title: "Error", prompt: `API Error: ${error.message}` }];
+  if (!response.text) {
+    throw new Error('The AI returned an empty response for background generation.');
   }
+
+  try {
+    const parsed = parseJsonSafe(response.text);
+    if (Array.isArray(parsed) && parsed.length > 0) {
+      return parsed.map((item: any, idx: number) => ({
+        title: String(item?.title || `Background ${idx + 1}`),
+        prompt: String(item?.prompt || '').trim(),
+      }));
+    }
+  } catch {
+    // Fallback
+  }
+
+  return [{ title: 'Background Prompt', prompt: stripMarkdownFences(response.text) }];
 }
